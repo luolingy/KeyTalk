@@ -106,10 +106,30 @@ func (FrameReceived) isTransportEvent() {}
 
 // Transport 是传输层接口。
 //
+// # Events() 的所有权规则（极其重要）
+//
+// **Events() 有且只能有一个消费者。**
+//
+// 该 channel 不做扇出：每个事件只会被某个 goroutine 读到一次。
+// 因此第二个读者**不会**看到"相同的事件流"，而是与第一个读者
+// **随机瓜分**事件——各拿到大约一半。症状极其具有误导性：
+// 传输层日志显示"已读取 192 字节"，而会话层却什么都没收到，
+// 看起来完全像底层丢包，实际是上层在互相偷事件。
+//
+// 本项目在开发中**两次**踩到同一个坑（一次在 cmd/keytalk，
+// 一次在 internal/core），因此这条规则写进接口契约：
+//
+//   - `session.Manager` 是 Events() 的持有者，负责驱动协议状态机。
+//   - 其他任何组件（core、UI、CLI）需要感知对端状态时，
+//     必须改用 **Peers() 快照轮询**，而**不是**去读 Events()。
+//   - 若确实需要第二路事件流，必须在实现内做显式扇出，
+//     而不是让多个调用方各自去读同一个 channel。
+//
 // 实现必须保证：
 //
 //   - Events() 返回的 channel 由实现方关闭（在 Close 之后），
 //     且**绝不**在持锁状态下发送，避免与 Close 死锁。
+//   - Peers() 是并发安全的，且不消费任何事件——它只是读快照。
 //   - Send 是并发安全的。
 //   - Send 在未连接时返回 ErrNotConnected（可重试语义），
 //     而不是阻塞或静默丢弃。
@@ -127,7 +147,20 @@ type Transport interface {
 	Send(peerID PeerID, frame []byte) error
 
 	// Events 返回事件流。
+	//
+	// ⚠️ 只允许有一个消费者（见上文的契约说明）。
+	// 需要额外观察对端状态的组件请使用 Peers()。
 	Events() <-chan TransportEvent
+
+	// Peers 返回当前已知对端的快照。
+	//
+	// 这是 Events() 之外**唯一**受支持的观察方式：
+	// 它不消费事件，因此可以与 Events() 的持有者并存。
+	// 返回的切片是拷贝，调用方可安全持有与修改。
+	//
+	// 典型用法是按固定间隔轮询，据此推导"谁在线"，
+	// 而不是去解析 PeerFound/PeerLost 事件流。
+	Peers() []PeerInfo
 
 	// Close 关闭传输层，释放监听端口与发现资源。
 	Close() error

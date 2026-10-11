@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -130,12 +131,28 @@ func randomBytes(n int) []byte {
 // GC 可能在复制 []byte 时留下未清零副本，编译器可能优化掉死代码。
 // 这能减少密钥驻留时间，但**不构成**抗内存取证的保证。
 func zero(b []byte) {
+	if len(b) == 0 {
+		return
+	}
 	for i := range b {
 		b[i] = 0
 	}
-	// 防止编译器将上面的写入判定为死代码。
-	escapeSink = b
+	// 防止编译器把上面的写入判定为死代码。
+	//
+	// ⚠️ 这里**不能**用一个包级全局变量来"逃逸"这个切片。
+	//
+	// 早期实现写的是 `escapeSink = b`（一个 var escapeSink []byte）。
+	// 那是错的，而且是安全相关的错误，不只是数据竞争：
+	//
+	//   1. **数据竞争**：每个并发的握手 goroutine 都会写同一个全局变量，
+	//      竞争检测器直接报 DATA RACE（实测两个并发 Respond 就触发）。
+	//   2. **更严重的语义问题**：那个全局变量会**持有**最后写入的切片。
+	//      也就是说，被"清零"的那块临时密钥缓冲反而多了一个全局引用，
+	//      在下次 zero() 覆盖它之前一直不能被 GC 回收——
+	//      清零的目的（缩短密钥驻留时间）被这个引用抵消了一部分。
+	//
+	// 正确做法：让切片经由一个**函数局部**的、编译器无法证明死掉的
+	// 操作逃逸。用 runtime.KeepAlive 表达"到这里为止 b 仍被使用"，
+	// 既阻止了死代码消除，又不引入任何跨 goroutine 的共享状态。
+	runtime.KeepAlive(b)
 }
-
-// escapeSink 阻止编译器把敏感缓冲的清零操作优化掉。
-var escapeSink []byte

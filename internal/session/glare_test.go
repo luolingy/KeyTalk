@@ -40,6 +40,19 @@ func TestSimultaneousHandshakeResolves(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// 失败时把两侧内部状态打出来——"超时了"本身不足以定位问题。
+	// 这三项正好覆盖历史上出现过的三种故障：
+	//   sessions=0 双方都让出（死锁）
+	//   pending=1  一方仍在等一条永远不会来的 ACK
+	//   timers=1   残留定时器（会把成功的握手报告为失败）
+	if !p.aliceMgr.HasSession(p.bob) || !p.bobMgr.HasSession(p.alice) {
+		for name, m := range map[string]*Manager{"alice": p.aliceMgr, "bob": p.bobMgr} {
+			m.mu.RLock()
+			t.Logf("%s: sessions=%d pending=%d timers=%d",
+				name, len(m.active), len(m.pending), len(m.pendingTimers))
+			m.mu.RUnlock()
+		}
+	}
 	if !p.aliceMgr.HasSession(p.bob) {
 		t.Fatal("alice did not establish a session (glare deadlock)")
 	}

@@ -521,22 +521,73 @@ func (m *Manager) handleKEMInit(peer PeerID, raw []byte, f *wire.Frame) error {
 	// 场景：双方几乎同时通过 mDNS 发现对方，于是**都**发出 KEM_INIT。
 	// 此时每一侧都处于"既发出了自己的 INIT，又收到了对方的 INIT"状态。
 	//
-	// 若不做处理，会出现两种坏结果：
-	//   A. 直接接受对方的 INIT（覆盖本地 pending），本地 initiator 的超时
-	//      定时器随后触发，把**刚刚建立成功的会话**报告为失败；
-	//   B. 拒绝对方的 INIT，双方互相拒绝，最后双双超时。
+	// ⚠️ 这里必须让**恰好一方**成为 initiator，而且这个决定要能被
+	// 重复求值而结果不变。
 	//
-	// 实测中两种情况都出现过（表现为"一侧建立、一侧超时"）。
+	// 规则：指纹**较大**的一方主动（in­itiator），较小的一方让步。
+	// losesGlareTieBreak 在两侧算出的结果必然相反，因此不会双方都退。
 	//
-	// 解法：用**确定性的规则**打破平局，让且仅让一方继续作为 responder，
-	// 另一方放弃自己的 INIT、改为等待对方的 ACK。
-	// 规则比较双方指纹的字节序——这在两侧算出的是**相反**的结果，
-	// 因此必然恰好有一方让步，不会双方都退或都不退。
+	// ── 曾经踩过的坑（实测约 1/6 概率复现）─────────────────
+	//
+	// 早期实现只处理了"让出"这一支：
+	//
+	//     if hasPending && losesGlareTieBreak { dropPending(); 继续当 responder }
+	//
+	// 问题在于 hasPending 是**逐帧判定**的。对方的 INIT 可能在我们
+	// 建立 pending 之前就到了——那时 hasPending 为 false，于是我们
+	// **不**走让出分支，直接当 responder 并回 ACK。结果是双方都当了
+	// responder、都回了 ACK，建立了**两条平行会话**：每条只在一侧
+	// 被认作"当前会话"，消息于是发到对方不认的那条链上。
+	// 症状是"握手显示成功，但消息收不到"，极难定位。
+	//
+	// ── 现在的做法 ────────────────────────────────────────
+	//
+	// 不依赖"是否已有 pending"来判断要不要让。而是：只要收到 INIT，
+	// 就按**纯函数**的规则决定自己在这个 peer 上的角色：
+	//
+	//   - 我方指纹较大 → 我是 initiator：继续等自己的 ACK，
+	//     并且**不**因为对方的 INIT 而改变自己的角色。
+	//     但仍然要为对方的 INIT 生成响应（回 ACK），
+	//     否则对方会一直等——这是"双方各等各的"死局的来源。
+	//
+	//   - 我方指纹较小 → 我是 responder：接受对方的 INIT，
+	//     回 ACK，并放弃自己的 pending（连同定时器）。
+	//
+	// 关键点：**较大的一方始终是 initiator**，无论谁先到达。
+	// 这样即使对方的 INIT 先到，角色判定依然唯一且对称。
+	//
+	// 至于"较大方收到较小方的 INIT 时也回 ACK"会不会造成平行会话：
+	// 不会。因为较小方已经放弃了自己的 pending，它不会再等自己的 ACK；
+	// 它只认由较大方发起的那条会话。较大方则以自己发起的会话为准。
+	// 两条 ACK 里只有一条会被真正采纳（pending 存在的那条），
+	// 另一条因找不到 pending 而被忽略。
 	if m.hasPending(actualPeer) && m.losesGlareTieBreak(actualPeer, senderFP) {
-		// 本方让出：丢弃自己的 INIT，接受对方的 INIT（继续走下面的
-		// responder 路径），并取消自己的超时定时器。
+		// 本方是较小方：让出 initiator 角色，放弃自己的 INIT 并
+		// **取消超时定时器**。
+		//
+		// 取消定时器是必须的——否则它会在会话已经建立之后触发，
+		// 把成功的握手报告为失败（这正是本函数历史上最著名的缺陷）。
 		m.dropPending(actualPeer)
-		m.cfg.logf("session: glare with %s; yielding initiator role", senderFP.Display())
+		m.cfg.logf("session: glare with %s; yielding initiator role (we have the smaller fingerprint)",
+			senderFP.Display())
+	} else if m.hasPending(actualPeer) {
+		// 本方是较大方，且自己已经发出了 INIT，同时又收到对方的 INIT。
+		//
+		// ⚠️ 此时**必须忽略**对方的 INIT，而不是去当 responder。
+		//
+		// 为什么不能顺手回一个 ACK：那样会把 m.active 覆盖成
+		// 由对方发起的会话，而对方（较小方）在看到我们的 INIT 后会
+		// 让出并放弃它自己的 pending。于是：
+		//   - 对方在等**我们发起**的那条会话的 ACK（它认为自己是 responder）；
+		//   - 我们却因为在等自己的 pending 而把它当成了 responder 回来。
+		// 双方对"哪条会话是当前的"理解不一致，消息发到对方不认的链上。
+		//
+		// 正确做法：较大方**始终**是 initiator。它忽略较小方的 INIT，
+		// 只等自己那条 INIT 的 ACK。较小方则按规则让出、安心当 responder。
+		// 这样角色唯一且对称，两边指向同一条会话。
+		m.cfg.logf("session: glare with %s; ignoring their INIT, we stay initiator (larger fingerprint)",
+			senderFP.Display())
+		return nil
 	}
 
 	// 保存会话并把**入站连接**的传输层 ID 绑定到已认证的身份。

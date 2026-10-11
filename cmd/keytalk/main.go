@@ -465,13 +465,18 @@ func (a *app) watchPeers(ctx context.Context) {
 			return
 		case <-tick.C:
 			snap := a.tr.Peers()
+			// 索引化，便于按指纹查找（Peers 返回有序切片）。
+			online := make(map[transport.PeerID]bool, len(snap))
+			for _, p := range snap {
+				online[p.ID] = true
+			}
 			a.mu.Lock()
 			for _, c := range a.contacts {
 				id := session.PeerID(c.fp.String())
 				st := a.peers[id]
 				st.name = c.name
 
-				_, present := snap[transport.PeerID(id)]
+				_, present := online[transport.PeerID(id)]
 				wasOnline := st.online
 				st.online = present
 				if present {

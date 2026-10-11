@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -389,11 +390,19 @@ func (t *Transport) handleRecord(r parsedRecord) {
 	case !existed:
 		shouldEmit = true
 	case addrCount != lastAddrCount:
+		// ⚠️ lastPeerEmit 必须**在锁内**访问。
+		//
+		// 这个 map 会被多个接口的 mDNS 读循环并发调用 handleRecord 访问
+		// （每个接口一个 goroutine）。若在锁外读写，就是数据竞争；
+		// Go 的 map 在并发写入时还可能直接抛 "concurrent map writes" 崩溃。
+		// 这里同时读+写，是竞争检测器抓到的真实缺陷。
+		t.mu.Lock()
 		now := time.Now()
 		if now.Sub(t.lastPeerEmit[peerID]) >= peerEmitInterval {
 			shouldEmit = true
 			t.lastPeerEmit[peerID] = now
 		}
+		t.mu.Unlock()
 	}
 
 	if shouldEmit {
@@ -510,7 +519,17 @@ func (t *Transport) AdoptConnection(tempID, realID transport.PeerID) {
 
 	// 若已有同 ID 的旧连接，关闭它——
 	// 但这次是**基于已验证身份**的替换，与按 IP 猜测有本质区别。
+	// 若该身份下已有另一条连接，保留**可用于回复入站消息**的那条。
+	//
+	// 关键场景：Bob 主动拨号建立了 outbound，同时又收到 Alice 的
+	// inbound（两条独立的 TCP 连接）。Bob 作为 responder 必须在
+	// inbound 上回 ACK——因为 Alice 的 initiator 分支正在等那条连接。
+	// 若这里把 inbound 关掉而留下 outbound，Bob 的 ACK 会发到
+	// Alice 没有在监听的连接上，表现为"Bob 永远等不到握手完成"。
+	//
+	// 因此：入站连接优先——它是**对端主动建立**的，对端一定在等它。
 	if old, exists := t.conns[realID]; exists {
+		t.cfg.logf("lan: adopting inbound %s over existing connection to %s", tempID, short(string(realID)))
 		_ = old.Close()
 	}
 	t.conns[realID] = c
@@ -518,7 +537,7 @@ func (t *Transport) AdoptConnection(tempID, realID transport.PeerID) {
 	c.setPeerID(realID)
 	t.mu.Unlock()
 
-	t.cfg.logf("lan: adopted inbound connection %s as %s", tempID, short(string(realID)))
+	t.cfg.logf("lan: adopted inbound connection %s as %s (map now holds the inbound)", tempID, short(string(realID)))
 }
 
 // registerConn 注册一条连接并启动读写循环。
@@ -612,6 +631,20 @@ func (t *Transport) connFor(peerID transport.PeerID) (*conn, error) {
 	t.mu.RLock()
 	c, ok := t.conns[peerID]
 	info, found := t.peers[peerID]
+	// ⚠️ 必须**在锁内深拷贝**地址切片。
+	//
+	// t.peers 存的是 *PeerInfo 指针，而 discoveryLoop 会在
+	// handleRecord 里对同一个 PeerInfo 追加地址（每个网卡一个
+	// 读循环，都是并发 goroutine）。若把 info 指针带出锁再读
+	// info.Addrs，就是与 append 的数据竞争——竞争检测器抓到过，
+	// 而且 append 触发扩容时可能读到被替换掉的旧底层数组。
+	//
+	// 拷贝后，后续排序/拨号完全在本地切片上操作，无共享。
+	var addrs []net.Addr
+	if found {
+		addrs = make([]net.Addr, len(info.Addrs))
+		copy(addrs, info.Addrs)
+	}
 	t.mu.RUnlock()
 
 	if ok && !c.isClosed() {
@@ -622,7 +655,7 @@ func (t *Transport) connFor(peerID transport.PeerID) (*conn, error) {
 		// 复用是默认路径，重连只发生在连接确实已断时。
 		return c, nil
 	}
-	if !found || len(info.Addrs) == 0 {
+	if !found || len(addrs) == 0 {
 		return nil, fmt.Errorf("%w: %s", transport.ErrPeerUnknown, peerID)
 	}
 
@@ -643,16 +676,19 @@ func (t *Transport) connFor(peerID transport.PeerID) (*conn, error) {
 	// 因此优先选 IPv4：在局域网里它最可靠，且能保证
 	// 双方对"这是哪条连接"的理解一致。
 	// IPv6 仅在完全没有 IPv4 候选时才用（纯 IPv6 网络）。
-	addrs := make([]net.Addr, 0, len(info.Addrs))
-	for _, a := range info.Addrs {
+	//
+	// 注意这里操作的是锁内拷贝出来的 addrs，不是共享的 info.Addrs。
+	preferV4 := make([]net.Addr, 0, len(addrs))
+	for _, a := range addrs {
 		if isIPv6Addr(a) {
 			continue
 		}
-		addrs = append(addrs, a)
+		preferV4 = append(preferV4, a)
 	}
-	if len(addrs) == 0 {
-		addrs = info.Addrs // 纯 IPv6 环境：没有选择余地
+	if len(preferV4) > 0 {
+		addrs = preferV4 // 有 IPv4 就用 IPv4
 	}
+	// 若 preferV4 为空，保留原 addrs（纯 IPv6 环境：没有选择余地）。
 
 	var lastErr error
 	for _, addr := range addrs {
@@ -678,13 +714,23 @@ func (t *Transport) Events() <-chan transport.TransportEvent { return t.events }
 // 这是对本接口的扩展（transport.Transport 未定义），
 // 供 core 在启动时拉取初始状态——否则在 Events 订阅之前
 // 已经发现的对端会被漏掉。
-func (t *Transport) Peers() map[transport.PeerID]transport.PeerInfo {
+// Peers 返回当前已知对端的快照（实现 transport.Transport）。
+//
+// 返回切片而非 map：调用方（core/CLI）只需要遍历，
+// 且切片是有序的，便于输出稳定、便于测试断言。
+//
+// 本方法**不消费事件**，因此可以与 Events() 的持有者并存。
+// 这是 Events() 之外唯一受支持的观察方式——见 transport.Transport
+// 接口上关于"Events() 只能有一个消费者"的契约说明。
+func (t *Transport) Peers() []transport.PeerInfo {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	out := make(map[transport.PeerID]transport.PeerInfo, len(t.peers))
-	for k, v := range t.peers {
-		out[k] = *v
+	out := make([]transport.PeerInfo, 0, len(t.peers))
+	for _, v := range t.peers {
+		out = append(out, *v)
 	}
+	// 按 ID 排序，保证顺序稳定（map 遍历顺序是随机的）。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -805,6 +851,9 @@ func stripZone(addr string) string {
 		return addr[:i]
 	}
 }
+
+func localOf(c *conn) string  { return c.nc.LocalAddr().String() }
+func remoteOf(c *conn) string { return c.nc.RemoteAddr().String() }
 
 // isIPv6Addr 判断地址是否为 IPv6（含链路本地）。
 func isIPv6Addr(a net.Addr) bool {
