@@ -108,6 +108,22 @@ type uiState struct {
 	// Gio 的 Clickable 需要跨帧保持状态才能识别点击；
 	// 每帧新建会让按钮永远收不到点击（表现为"点了没反应"）。
 	sendBtn widget.Clickable
+
+	// rowClicks 是联系人列表每一行的点击状态。
+	//
+	// ⚠️ 同样必须持久，且**按行索引**保存。
+	// 早期版本在 contactRow 里 `click := &widget.Clickable{}`，
+	// 导致整个联系人列表都点不动、右侧聊天区永远不出现。
+	rowClicks []widget.Clickable
+
+	// emojiAck 是"我确认这组 emoji 与对方一致"按钮。
+	emojiAck widget.Clickable
+
+	// verifying 是当前正在做 emoji 二次确认的对端 ID。
+	verifying string
+
+	// showEmojiDetail 控制是否展开完整的 12 字节 SAS 十六进制。
+	showEmojiDetail bool
 }
 
 func newState(opts Options) *uiState {
@@ -348,19 +364,33 @@ func emptyContactsText() string {
 
 // contactRows 绘制联系人列表。
 func (a *uiState) contactRows(gtx layout.Context, contacts []core.Contact) layout.Dimensions {
+	// 联系人行数变化时同步行点击状态。
+	//
+	// ⚠️ Clickable **必须**跨帧持久（见 docs/ui-gio.md §5.3.1）：
+	// 每帧 new 一个会让它永远收不到点击，表现为"点联系人没反应、
+	// 右侧聊天区永远不出现"。这正是本文件早期版本的真实缺陷。
+	if len(a.rowClicks) != len(contacts) {
+		if len(a.rowClicks) < len(contacts) {
+			grown := make([]widget.Clickable, len(contacts))
+			copy(grown, a.rowClicks)
+			a.rowClicks = grown
+		} else {
+			a.rowClicks = a.rowClicks[:len(contacts)]
+		}
+	}
+
 	return material.List(a.theme, &a.contactList).Layout(gtx, len(contacts),
 		func(gtx layout.Context, i int) layout.Dimensions {
 			c := contacts[i]
-			return a.contactRow(gtx, c)
+			return a.contactRow(gtx, c, &a.rowClicks[i])
 		})
 }
 
-func (a *uiState) contactRow(gtx layout.Context, c core.Contact) layout.Dimensions {
+func (a *uiState) contactRow(gtx layout.Context, c core.Contact, click *widget.Clickable) layout.Dimensions {
 	selected := c.ID == a.selected
 
 	// 整行可点：点击区域覆盖整行，而不是只有文字。
 	// 那是最基本的可用性要求——聊天软件里点不到行会让人烦躁。
-	click := &widget.Clickable{}
 	if click.Clicked(gtx) {
 		a.selected = c.ID
 		// 主动尝试建立会话。core 会按角色规则决定是否真的发起，
@@ -459,6 +489,16 @@ func (a *uiState) conversation(gtx layout.Context) layout.Dimensions {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions { return a.convHeader(gtx, c) }),
 		layout.Rigid(vLineH),
+		// emoji 二次确认面板：会话已建立但用户尚未核对时显示在最上方。
+		// 放在消息流**之上**而不是折叠起来——核对的可见性
+		// 直接决定它会不会真的发生。
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if c.Status != core.StatusSecure {
+				return layout.Dimensions{}
+			}
+			return a.verifyPanel(gtx, c)
+		}),
+		layout.Rigid(vLineH),
 		layout.Flexed(1, a.messageList),
 		layout.Rigid(vLineH),
 		layout.Rigid(a.composerArea),
@@ -476,12 +516,20 @@ func (a *uiState) convHeader(gtx layout.Context, c core.Contact) layout.Dimensio
 				return lbl.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				// 指纹直接显示在会话标题下。用户核对指纹时
-				// 不必再去翻设置——那一步越省事，越可能真的被做。
-				lbl := material.Caption(a.theme, c.Fingerprint.Display()+"  ·  "+statusLabel(c.Status))
-				lbl.Color = colorMuted
-				lbl.Font.Typeface = "monospace"
-				return lbl.Layout(gtx)
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						// 指纹直接显示在会话标题下。用户核对指纹时
+						// 不必再去翻设置——那一步越省事，越可能真的被做。
+						lbl := material.Caption(a.theme, c.Fingerprint.Display())
+						lbl.Color = colorMuted
+						lbl.Font.Typeface = "monospace"
+						return lbl.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return a.trustBadge(gtx, c)
+					}),
+				)
 			}),
 		)
 	})
@@ -583,6 +631,13 @@ func (a *uiState) composerArea(gtx layout.Context) layout.Dimensions {
 func (a *uiState) sendButton(gtx layout.Context) layout.Dimensions {
 	c, ok := a.opts.App.Contact(a.selected)
 	canSend := ok && c.Status == core.StatusSecure
+	// 未核对 emoji 时**允许**发送，但按钮显示为警示状态。
+	//
+	// 为什么不直接禁用：本工具第一次通信时双方还没法核对，
+	// 硬性阻断会让用户完全无法开始。产品上选择"允许但持续提醒"，
+	// 并且状态栏诚实显示"未核实身份"。
+	// 但同样是这个原因，界面**绝不能**在未核实时显示"已核实"。
+	needsVerify := canSend && !c.Verified
 
 	btn := &a.sendBtn
 	sent := btn.Clicked(gtx) || a.composer.Submit
@@ -607,14 +662,21 @@ func (a *uiState) sendButton(gtx layout.Context) layout.Dimensions {
 			// 让用户知道为什么不能点。
 			bc = colorSurfaceAlt
 			label = "未连接"
+		} else if needsVerify {
+			bc = colorWarn
+			label = "发送（未核实）"
 		}
 		fill(gtx, bc)
 		inset := layout.Inset{Top: unit.Dp(9), Bottom: unit.Dp(9), Left: unit.Dp(18), Right: unit.Dp(18)}
 		dims := inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			lbl := material.Body2(a.theme, label)
-			if canSend {
+			switch {
+			case needsVerify:
+				// 深色字压在黄底上：黄底配白字几乎看不清。
+				lbl.Color = color.NRGBA{R: 0x1F, G: 0x18, B: 0x0A, A: 0xFF}
+			case canSend:
 				lbl.Color = color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
-			} else {
+			default:
 				lbl.Color = colorMuted
 			}
 			return lbl.Layout(gtx)

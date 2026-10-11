@@ -34,6 +34,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
 	"github.com/exeliang/keytalk/internal/transport"
 )
@@ -117,6 +118,24 @@ type Contact struct {
 	Status ContactStatus
 	// LastError 是最近一次失败的原因（Status 为 StatusFailed 时有效）。
 	LastError string
+
+	// Emoji 是本次会话的 SAS（emoji 二次确认）展示值。
+	//
+	// 仅当会话已建立（Status == StatusSecure）时非空。
+	// 用户需要与对方**带外**核对这组 emoji：一致才算真正可信。
+	Emoji []sas.Emoji
+
+	// Verified 表示用户**本人**已经核对并确认了 Emoji。
+	//
+	// ⚠️ 这与密码学校验是两件事，务必区分：
+	//   · 密码学校验（握手验签）：自动完成，证明对端持有联系人
+	//     表里那把公钥对应的私钥。**不能**证明那把公钥真的属于
+	//     你的朋友。
+	//   · Verified：需要人来比对 emoji，是对"公钥归属"的确认。
+	//
+	// 只有两者都成立，才谈得上"确认了对方身份"。
+	// 因此这个字段**只能**由 VerifyEmoji 设置，绝不随握手自动置真。
+	Verified bool
 }
 
 // Message 是一条聊天消息（不可变快照）。
@@ -289,6 +308,16 @@ type contactState struct {
 	transportID transport.PeerID
 	// started 记录本机是否已把该联系人注册进会话层。
 	started bool
+
+	// emoji 是本次会话的 SAS 展示值（会话建立后填充）。
+	emoji []sas.Emoji
+
+	// verified 表示用户已核对 emoji。
+	//
+	// ⚠️ 会话重建时必须重置为 false：新会话有新密钥、
+	// 新 emoji，旧的确认不能顺延——否则用户核对过的
+	// "那个人"会被自动套用到一条全新的链路上。
+	verified bool
 }
 
 // New 构造并启动 App。
@@ -427,6 +456,8 @@ func (a *App) Snapshot() []Contact {
 			Fingerprint: cs.fp,
 			Status:      cs.status,
 			LastError:   cs.err,
+			Emoji:       append([]sas.Emoji(nil), cs.emoji...),
+			Verified:    cs.verified,
 		})
 	}
 	return out
@@ -446,7 +477,59 @@ func (a *App) Contact(id string) (Contact, bool) {
 		Fingerprint: cs.fp,
 		Status:      cs.status,
 		LastError:   cs.err,
+		Emoji:       append([]sas.Emoji(nil), cs.emoji...),
+		Verified:    cs.verified,
 	}, true
+}
+
+// VerifyEmoji 标记"用户已与对方核对过这组 emoji 且一致"。
+//
+// ⚠️ 这是整个安全模型中**唯一**能解除"未核实"状态的入口，
+// 且必须由用户的明确动作触发（界面上的确认按钮）。
+//
+// 不要把它接到"握手成功"上自动调用：那会退化成 TOFU
+// （首次使用即信任），而 TOFU 恰恰是本项目想避免的——
+// 攻击者只要抢在真实联系人之前连接一次，就能长期冒名。
+//
+// 只有当会话确实建立、且 emoji 存在时才接受确认。
+func (a *App) VerifyEmoji(peerID string) error {
+	select {
+	case <-a.closed:
+		return ErrClosed
+	default:
+	}
+
+	a.mu.RLock()
+	cs, ok := a.contacts[peerID]
+	if !ok {
+		a.mu.RUnlock()
+		return fmt.Errorf("core: unknown contact %q", peerID)
+	}
+	status := cs.status
+	hasEmoji := len(cs.emoji) > 0
+	name := cs.cfg.Name
+	a.mu.RUnlock()
+
+	// 没有会话就没有可核对的 emoji——此时把联系人标成"已验证"
+	// 是纯粹的谎报，会让用户以为已经确认过身份。
+	if status != StatusSecure {
+		return fmt.Errorf("core: %s 的会话尚未建立，没有可核对的 emoji", name)
+	}
+	if !hasEmoji {
+		return fmt.Errorf("core: %s 的会话缺少核对用 emoji，请改用指纹手动核对", name)
+	}
+
+	a.mu.Lock()
+	cs.verified = true
+	a.mu.Unlock()
+
+	a.emit(ContactsChanged{})
+	a.emit(LogEvent{
+		Level: LogInfo,
+		Message: fmt.Sprintf(
+			"已确认 %s 的 emoji 一致；此后的通信已排除中间人（直到会话重建）", name),
+	})
+	return nil
 }
 
 // Messages 返回与某个联系人的消息记录快照（按时间正序）。
@@ -592,6 +675,24 @@ func (a *App) Shutdown() {
 		if a.mgr != nil {
 			a.mgr.Close()
 		}
+
+		// ⚠️ 必须关闭传输层。
+		//
+		// 它是"告诉对端我们走了"的唯一途径：
+		//   · 关闭 mDNS 会触发 announce(goodbye, TTL=0)，
+		//     对端立即把我们从发现表里移除；
+		//   · 关闭 TCP 连接会让对端 readLoop 收到 EOF，
+		//     进而上报 ConnClosed → StateChanged{Closed}。
+		//
+		// 不关闭的后果（实测）：本端已退出，对端却仍显示
+		// "在线/已加密"，要等完整的 peerTTL(90s) 才回落。
+		// 用户看到的就是"一边关了、另一边还显示连着"。
+		if a.cfg.Transport != nil {
+			if err := a.cfg.Transport.Close(); err != nil {
+				a.logf("core: close transport: %v", err)
+			}
+		}
+
 		a.wg.Wait()
 		close(a.events)
 	})

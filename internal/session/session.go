@@ -88,6 +88,16 @@ type HandshakeDone struct {
 	Peer     PeerID
 	Verified bool
 	Epoch    uint64
+
+	// SAS 是双方各自计算的**握手记录哈希**，用于带外核对。
+	//
+	// 这是 Matrix 式"emoji 二次确认"的输入：两端用同一份哈希
+	// 派生出同一组 emoji，用户比对一致即可确认没有中间人。
+	//
+	// ⚠️ 它与会话密钥**相互独立**（是记录哈希，不是密钥本身），
+	// 因此即使泄漏也不影响机密性；但仍不应记录到日志里，
+	// 因为它的用途是"人类比对"，写进日志会削弱这个语义。
+	SAS []byte
 }
 
 // HandshakeFailed 表示握手失败。
@@ -623,7 +633,10 @@ func (m *Manager) handleKEMInit(peer PeerID, raw []byte, f *wire.Frame) error {
 	}
 
 	m.emit(StateChanged{Peer: actualPeer, State: crypto.StateEstablished, Previous: crypto.StateInit})
-	m.emit(HandshakeDone{Peer: actualPeer, Verified: true, Epoch: 0})
+	m.emit(HandshakeDone{
+		Peer: actualPeer, Verified: true, Epoch: 0,
+		SAS: res.Session.HandshakeHash(),
+	})
 	m.cfg.logf("session: handshake completed with %s (responder), signed by %s",
 		actualPeer, senderFP.Display())
 	return nil
@@ -719,7 +732,10 @@ func (m *Manager) handleKEMAck(peer PeerID, raw []byte, f *wire.Frame) error {
 	m.mu.Unlock()
 
 	m.emit(StateChanged{Peer: peer, State: crypto.StateEstablished, Previous: crypto.StateSentInit})
-	m.emit(HandshakeDone{Peer: peer, Verified: true, Epoch: 0})
+	m.emit(HandshakeDone{
+		Peer: peer, Verified: true, Epoch: 0,
+		SAS: pending.Session.HandshakeHash(),
+	})
 	m.cfg.logf("session: handshake completed with %s (initiator), hash=%x",
 		peer, ackPT.Handshake[:4])
 	return nil

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
 	"github.com/exeliang/keytalk/internal/transport"
 )
@@ -19,6 +21,12 @@ const (
 	cmdPeerLost
 	cmdSessionReady
 	cmdSessionFailed
+	// cmdSessionLost 表示会话从"已建立"回落到"未加密"
+	// （对端断开、或重新开始握手）。
+	//
+	// 与 cmdSessionFailed 的区别很重要：失败要显示红色错误，
+	// 而"正在握手/刚断开"只是状态回退，不该让用户以为出了问题。
+	cmdSessionLost
 )
 
 // command 是一条投递给事件循环的命令。
@@ -32,6 +40,9 @@ type command struct {
 	text        string
 	transportID transport.PeerID
 	err         error
+
+	// sas 是握手记录哈希，用于派生 emoji 二次确认的展示值。
+	sas []byte
 }
 
 // run 是 core 的事件循环：唯一修改状态的地方。
@@ -67,6 +78,9 @@ func (a *App) handle(c command) {
 
 	case cmdSessionFailed:
 		a.handleSessionFailed(c)
+
+	case cmdSessionLost:
+		a.handleSessionLost(c)
 	}
 }
 
@@ -270,7 +284,32 @@ func (a *App) handlePeerLost(c command) {
 	if changed {
 		cs.status = StatusOffline
 	}
+
+	// ⚠️ 但对端离线必须**清除**已核对状态与 emoji。
+	//
+	// 这两者都是"某一次具体会话"的属性。对端已经走了，
+	// 下一次连接必然是**新会话**：新密钥、新握手哈希、新 emoji。
+	// 若把旧的已核对状态留着，用户曾核对过的"那个人"
+	// 会被自动套用到一条全新的链路上——攻击者只要等一次
+	// 正常的断线重连，就能继承用户此前给出过的信任。
+	//
+	// 界面也依赖这一点：不清除的话，一个已经离线甚至已经
+	// 换成别人的对端，标签仍会显示"已核实"。
+	verificationDropped := cs.verified || cs.emoji != nil
+	cs.verified = false
+	cs.emoji = nil
 	a.mu.Unlock()
+
+	if verificationDropped {
+		a.emit(LogEvent{
+			Level: LogWarn,
+			Message: fmt.Sprintf(
+				"%s 已离线；先前的 emoji 核对结果已失效，下次连接需重新核对", name),
+		})
+	}
+	if verificationDropped {
+		a.emit(ContactsChanged{})
+	}
 
 	if changed {
 		a.logf("core: %s went offline", name)
@@ -281,8 +320,6 @@ func (a *App) handlePeerLost(c command) {
 
 // handleSessionReady 处理握手成功。
 func (a *App) handleSessionReady(c command) {
-	a.setStatus(c.peer, StatusSecure, "")
-
 	a.mu.RLock()
 	cs, ok := a.contacts[c.peer]
 	a.mu.RUnlock()
@@ -290,13 +327,90 @@ func (a *App) handleSessionReady(c command) {
 		return
 	}
 
+	// 派生出本次会话的 emoji 二次确认值。
+	//
+	// 派生失败**不阻断**会话：加密本身已经可用，emoji 只是
+	// 帮助用户确认"公钥属于谁"。但必须明确告知用户
+	// 无法核对，而不是悄悄跳过这一步。
+	var emojis []sas.Emoji
+	if len(c.sas) > 0 {
+		var err error
+		emojis, err = sas.FromHandshakeHash(c.sas)
+		if err != nil {
+			a.logf("core: derive SAS for %s failed: %v", c.peer, err)
+			a.emit(LogEvent{
+				Level: LogWarn,
+				Message: fmt.Sprintf(
+					"无法为与 %s 的会话生成核对用 emoji：%v；请改用指纹手动核对",
+					cs.cfg.Name, err),
+			})
+		}
+	}
+
+	a.setEmoji(c.peer, emojis)
+	a.setStatus(c.peer, StatusSecure, "")
+
+	// ⚠️ 这里**刻意**不把 Verified 置为 true。
+	//
+	// 密码学校验（验签）已经自动完成，但"对方就是你朋友"
+	// 这件事只能由人确认。自动置真等于把 TOFU 的结果
+	// 伪装成"已核实"，用户会以为自己核对过。
 	a.emit(LogEvent{
-		Level:   LogInfo,
-		Message: fmt.Sprintf("与 %s 的端到端加密会话已建立（身份已校验）", cs.cfg.Name),
+		Level: LogInfo,
+		Message: fmt.Sprintf(
+			"与 %s 的加密会话已建立。请与对方核对下方 emoji 后再开始通信。",
+			cs.cfg.Name),
 	})
 }
 
 // handleSessionFailed 处理握手失败。
+// handleSessionLost 处理会话回落（断开或重新握手）。
+//
+// 与 handleSessionFailed 的关键区别：这**不是错误**。
+// 对端离线、网络抖动、或双方重新协商都会走到这里。
+// 若按失败处理，用户会看到红字错误——但那只是一次正常的状态变化，
+// 徒增恐慌。因此这里回到 Online（仍可重连）而不是 Failed。
+func (a *App) handleSessionLost(c command) {
+	a.mu.RLock()
+	cs, ok := a.contacts[c.peer]
+	a.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	// 只有在**曾经**是 Secure 时才需要提示，避免正常握手过程中的
+	// Init/SentInit 抖动刷出多余的日志。
+	wasSecure := cs.status == StatusSecure
+
+	// 会话没了，之前那份"用户已核对 emoji"的确认也随之失效。
+	// 这很重要：不能让一次旧确认把**新的**会话自动标成已验证——
+	// 新会话有新密钥，用户必须重新核对。
+	a.setVerified(c.peer, false, "")
+
+	a.setStatus(c.peer, StatusOnline, "")
+
+	if wasSecure {
+		a.emit(LogEvent{
+			Level:   LogWarn,
+			Message: fmt.Sprintf("与 %s 的加密会话已结束（连接断开或正在重新握手）", cs.cfg.Name),
+		})
+	}
+}
+
+// stateHint 把会话状态翻译成一句给用户看的话。
+func stateHint(s crypto.State) string {
+	switch s {
+	case crypto.StateInit:
+		return "等待握手"
+	case crypto.StateSentInit:
+		return "正在握手"
+	case crypto.StateClosed:
+		return "连接已断开"
+	default:
+		return ""
+	}
+}
+
 func (a *App) handleSessionFailed(c command) {
 	errStr := ""
 	if c.err != nil {
@@ -320,6 +434,58 @@ func (a *App) handleSessionFailed(c command) {
 }
 
 // setStatus 更新联系人状态并广播变化。
+// setVerified 清除"用户已核对 emoji"标记。
+//
+// 用于会话重建：新会话有新密钥、新 emoji，
+// 旧的确认不能顺延到新链路上。
+func (a *App) setVerified(peerID string, verified bool, _ string) {
+	a.mu.Lock()
+	cs, ok := a.contacts[peerID]
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	changed := cs.verified != verified
+	cs.verified = verified
+	if !verified && cs.emoji != nil {
+		// 会话没了：清掉 emoji，避免界面上残留一组
+		// 已经无效的核对值。
+		cs.emoji = nil
+		changed = true
+	}
+	a.mu.Unlock()
+
+	if changed {
+		a.emit(ContactsChanged{})
+	}
+}
+
+// setEmoji 记录本次会话的 SAS 展示值，并**清除**旧的核对状态。
+//
+// ⚠️ 必须清除：每次会话建立都会产生新的握手哈希，
+// 于是 emoji 也会变。若沿用旧确认，用户核对过的那组符号
+// 会被自动套用到一条全新的链路上——那正是攻击者想要的结果。
+func (a *App) setEmoji(peerID string, emojis []sas.Emoji) {
+	a.mu.Lock()
+	cs, ok := a.contacts[peerID]
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	wasVerified := cs.verified
+	cs.emoji = emojis
+	cs.verified = false
+	a.mu.Unlock()
+
+	if wasVerified {
+		a.emit(LogEvent{
+			Level:   LogWarn,
+			Message: "会话已重建，先前的 emoji 核对结果已失效，请重新核对",
+		})
+	}
+	a.emit(ContactsChanged{})
+}
+
 func (a *App) setStatus(peerID string, status ContactStatus, errStr string) {
 	a.mu.Lock()
 	cs, ok := a.contacts[peerID]
@@ -405,13 +571,43 @@ func (a *App) consumeSessionEvents() {
 			}
 			switch e := ev.(type) {
 			case session.HandshakeDone:
-				a.post(command{kind: cmdSessionReady, peer: string(e.Peer)})
+				// 把握手记录哈希带过去，由事件循环派生出
+				// emoji 二次确认的展示值。
+				a.post(command{
+					kind: cmdSessionReady,
+					peer: string(e.Peer),
+					sas:  e.SAS,
+				})
 
 			case session.HandshakeFailed:
 				a.post(command{kind: cmdSessionFailed, peer: string(e.Peer), err: e.Err})
 
 			case session.StateChanged:
-				a.post(command{kind: cmdSessionReady, peer: string(e.Peer)})
+				// ⚠️ 这里**必须**按状态分派，不能一律当作"已就绪"。
+				//
+				// StateChanged 会带着多种状态发出：StateInit、
+				// StateSentInit、StateEstablished、StateClosed。
+				// 早期版本把它们全部映射成 cmdSessionReady，
+				// 于是：
+				//   · 等待握手的 Init 被显示成"已加密"；
+				//   · 更糟的是 StateClosed（连接已断开、会话已销毁）
+				//     也被显示成"已加密"。
+				// 结果就是用户看到的"一边显示已连接、另一边还在握手"
+				// 以及"明明断了却还显示加密"。
+				switch e.State {
+				case crypto.StateEstablished:
+					a.post(command{kind: cmdSessionReady, peer: string(e.Peer)})
+				case crypto.StateClosed, crypto.StateInit, crypto.StateSentInit:
+					// 回到"在线但未加密"。注意 StateInit 与
+					// StateSentInit 表示**正在**握手，不是失败，
+					// 因此走 Online 而不是 Failed —— 否则一次正常的
+					// 重连会闪出红色错误。
+					a.post(command{
+						kind: cmdSessionLost,
+						peer: string(e.Peer),
+						text: stateHint(e.State),
+					})
+				}
 
 			case session.Message:
 				msg := a.recordMessage(string(e.Peer), e.Plaintext.Text, false)
@@ -419,6 +615,26 @@ func (a *App) consumeSessionEvents() {
 			}
 		}
 	}
+}
+
+// isSelfPeer 报告一个传输层对端是否就是本机。
+//
+// 为什么需要这个判断：mDNS 的广播会回到本机（尤其在启用了
+// loopback 发现、或机器只有一块网卡时），于是每个实例都会
+// "发现"自己。若不排除，用户会在日志里看到一条
+// "discovered peer <自己的指纹> is not a known contact"，
+// 既困惑又像是安全问题（有陌生设备在连我？）。
+//
+// 判定依据是指纹——这是**身份**，与 IP 无关。刻意不用 IP：
+// 同一台机器可以有多个地址，而"自己"是由密钥定义的。
+func (a *App) isSelfPeer(id transport.PeerID) bool {
+	own := a.cfg.Identity.Fingerprint().String()
+	if string(id) == own {
+		return true
+	}
+	// 传输层 ID 在握手前可能是 "inbound:<地址>" 这类临时值；
+	// 那些不是身份，不在这里判断（也无法判断）。
+	return false
 }
 
 // watchPeers 轮询传输层的对端快照，推导"谁在线"。
@@ -462,6 +678,16 @@ func (a *App) watchPeers(ctx context.Context) {
 				// 传输层 ID 在本项目中就是指纹，但也可能是
 				// "inbound:<地址>" 这样的临时值——后者不可作为身份，
 				// 只在握手完成后由 AdoptConnection 改名。
+				//
+				// ⚠️ 必须过滤掉**自己**。
+				// mDNS 会把本机的广播也投递回来（loopback 或
+				// 同一网卡的回环），于是每个实例都会发现"自己"
+				// 并报告为陌生联系人。虽然随后会被忽略（不是已知
+				// 联系人），但那两条日志是纯粹的噪声，也会让用户
+				// 以为有陌生设备在连接。
+				if a.isSelfPeer(transport.PeerID(p.ID)) {
+					continue
+				}
 				cur[string(p.ID)] = true
 			}
 

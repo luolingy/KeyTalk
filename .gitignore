@@ -6,6 +6,7 @@
 
 # Runtime data. identity.json holds a PLAINTEXT private key — never commit it.
 /demo/
+/demo-*/
 /keytalk-data/
 /failures/
 *.key

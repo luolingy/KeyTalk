@@ -80,6 +80,32 @@ func (c *Config) logf(format string, args ...any) {
 // 又快到用户察觉不到延迟。
 const peerEmitInterval = 500 * time.Millisecond
 
+// peerTTL 是对端在"没有再收到任何宣告"后被视为离线的时间。
+//
+// ⚠️ 必须与**实际宣告周期**匹配，否则会不停误判离线。
+//
+// 宣告周期默认 30s（见 Config.announceInterval）；TTL 取 3 倍，
+// 即容错两次连续丢包。这是实测踩出来的：
+//
+//	第一版把 TTL 设成 6s。结果是两个**都正常运行**的实例
+//	每 6 秒互相判一次离线、再判一次在线，界面疯狂闪烁
+//	"在线/离线"，日志里全是 went offline / is online。
+//	  6s << 30s，等于每一次宣告之间的空档都被判成了掉线。
+//
+// 为什么不用 TCP 连接状态代替：mDNS 是独立于连接的发现通道，
+// 对端切换网卡时连接会断但不应立刻判定离线。用 TTL 更保守。
+//
+// 90s 的实际含义：对端**优雅退出**会立即发 goodbye（TTL=0），
+// 因此正常关闭是即时的；只有进程被强杀（来不及发 goodbye）
+// 才需要等 90s。这个代价换来的是"绝不误报离线"。
+const peerTTL = 90 * time.Second
+
+// peerSweepInterval 是过期检查的频率。
+//
+// 不需要很频繁：TTL 是 90s，每 5 秒检查一次带来的额外延迟
+// 可以忽略，而更稀疏的检查也少一点无谓的锁竞争。
+const peerSweepInterval = 5 * time.Second
+
 type Transport struct {
 	cfg Config
 
@@ -265,6 +291,21 @@ func (t *Transport) discoveryLoop(ctx context.Context, port uint16) {
 			t.handleRecord(r)
 		}
 	})
+
+	// 对端过期清理。
+	//
+	// ⚠️ 这一条是整个发现机制里最容易漏掉的一半：只加不减。
+	//
+	// 早先的实现只在 handleRecord 里写入 peers，**从不删除**，
+	// 于是对端进程退出后本端永远认为它还在线（LastSeen 只写不读）。
+	// 用户看到的现象是"一边显示已连接、另一边其实早就关了"，
+	// 而且 core 的 cmdPeerLost 分支成了永远走不到的死代码。
+	//
+	// 判据用 LastSeen 而不是 TCP 连接状态：mDNS 是**独立于连接**
+	// 的发现通道，对端可能只是暂时不宣告（例如切换网络），
+	// 此时连接虽断但不应立刻判定离线。TTL 取宣告周期的若干倍，
+	// 既能及时反映退出，又不会因丢一两个包就误判。
+	go t.sweepPeers(ctx)
 
 	announce := func(ttl uint32) {
 		pkt, err := announcement(service, host, port, txt, ttl)
@@ -586,6 +627,70 @@ func (t *Transport) registerConn(peerID transport.PeerID, nc net.Conn) *conn {
 	}()
 
 	return c
+}
+
+// sweepPeers 定期清理长时间没有宣告的对端，并上报 PeerLost。
+//
+// 这是发现机制"减"的那一半。没有它，peers 只增不减：
+// 对端退出后本端永远认为它在线，上层也就永远收不到离线事件，
+// 界面会一直显示"已连接"——本项目真实发生过这个故障。
+//
+// ⚠️ 只删 peers（发现缓存），**不动** conns。
+// 连接的生命周期由 readLoop/writeLoop 的错误回调管理，
+// 两者是不同的关注点：mDNS 消失不代表 TCP 一定断了
+// （例如对端只是切了网卡但连接仍在），反之亦然。
+// 把它们耦合成一件事会导致"发现抖动 → 连接被误杀"。
+func (t *Transport) sweepPeers(ctx context.Context) {
+	ticker := time.NewTicker(peerSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		now := time.Now()
+		var expired []transport.PeerID
+		self := transport.PeerID(t.cfg.Fingerprint)
+
+		t.mu.Lock()
+		for id, info := range t.peers {
+			// ⚠️ 绝不让自己过期。
+			//
+			// 本机的 mDNS 宣告会回到自己（组播回环），
+			// 于是 peers 里存在一条"我自己"的记录。
+			// 若不排除，每个实例都会定期把自己的记录删掉
+			// 并上报 PeerLost——日志里出现
+			// "peer <自己的指纹> expired"，既困惑又无意义。
+			// （上层 core 会过滤自己，但传输层不该制造这种噪声。）
+			if id == self {
+				continue
+			}
+			if now.Sub(info.LastSeen) <= peerTTL {
+				continue
+			}
+			expired = append(expired, id)
+			// 同时清理 byAddr 里指向它的条目，避免地址表
+			// 残留旧映射：重连时会把新地址关联到同一个 ID，
+			// 旧条目留着会让 connFor 拿到过期地址。
+			for addr, mapped := range t.byAddr {
+				if mapped == id {
+					delete(t.byAddr, addr)
+				}
+			}
+			delete(t.peers, id)
+			delete(t.lastPeerEmit, id)
+		}
+		t.mu.Unlock()
+
+		for _, id := range expired {
+			t.cfg.logf("lan: peer %s expired (no announcement for %v)",
+				short(string(id)), peerTTL)
+			t.emit(transport.PeerLost{ID: id})
+		}
+	}
 }
 
 // unregister 移除连接并上报关闭事件。

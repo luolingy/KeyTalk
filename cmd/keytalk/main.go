@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
 	"github.com/exeliang/keytalk/internal/transport"
 	"github.com/exeliang/keytalk/internal/transport/lan"
@@ -559,10 +560,26 @@ func (a *app) consumeSession(ctx context.Context) {
 				st.sessionOn = true
 				a.peers[e.Peer] = st
 				a.mu.Unlock()
-				fmt.Printf("\n🔒 与 %s 的端到端加密会话已建立（身份已校验）\n",
+				fmt.Printf("\n🔒 与 %s 的端到端加密会话已建立\n",
 					a.displayName(e.Peer))
 				// 稳定的 ASCII 标记，供脚本/测试断言。
 				fmt.Printf("session established IDENTITY_VERIFIED %s\n", e.Peer)
+
+				// emoji 二次确认（SAS）。
+				//
+				// 握手只能证明"对端持有联系人表里那把公钥的私钥"，
+				// 不能证明"那把公钥真的属于你朋友"。因此这里必须
+				// 把核对用的 emoji 摊给用户，并且**不**声称身份已确认。
+				if emojis, err := sas.FromHandshakeHash(e.SAS); err == nil {
+					fmt.Println()
+					fmt.Println("  ⚠ 请与对方核对以下 emoji，一致才能确认没有被中间人：")
+					fmt.Printf("\n      %s\n\n", sas.Format(emojis))
+					fmt.Printf("      （念给对方听：%s）\n", sas.FormatNames(emojis))
+					fmt.Println("  一致 = 通信可信；不一致 = 可能有人在冒充，请立即停止。")
+					fmt.Printf("  EMOJI_SAS %s\n", sas.Format(emojis))
+				} else {
+					fmt.Printf("  (无法生成核对用 emoji: %v；请改用指纹手动核对)\n", err)
+				}
 
 			case session.HandshakeFailed:
 				a.mu.Lock()
