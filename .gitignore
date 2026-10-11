@@ -1,0 +1,23 @@
+# Build artifacts
+/keytalk.exe
+/keytalk
+*.exe
+*.test
+
+# Runtime data. identity.json holds a PLAINTEXT private key — never commit it.
+/demo/
+/keytalk-data/
+/failures/
+*.key
+identity.json
+
+# Go build/module caches. These live inside the workspace only because the
+# sandbox's default cache location (F:\cache) is outside the writable area.
+# They are large and machine-specific, so they must never enter version control.
+/.gocache/
+/.gomodcache/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+*.swp
