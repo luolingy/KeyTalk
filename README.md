@@ -40,6 +40,7 @@
 | [docs/threat-model.md](docs/threat-model.md) | 威胁模型、防护边界、**明确不防什么** |
 | [docs/roadmap.md](docs/roadmap.md) | 分阶段实施路线与验收标准 |
 | [docs/running.md](docs/running.md) | **怎么跑起来**：命令行用法、一键验证、排错 |
+| [docs/ui-design.md](docs/ui-design.md) | 界面设计系统：信任编码规则、配色、必须持久化的状态 |
 | [docs/implementation-notes.md](docs/implementation-notes.md) | **实现笔记**：踩过的坑、为什么代码长这样、安全决策理由 |
 
 ---
