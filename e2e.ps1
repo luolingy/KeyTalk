@@ -12,7 +12,10 @@ Set-Location $root
 
 $env:GOTELEMETRY = "off"
 $env:GOCACHE    = "F:\exeliang\KeyTalk\.gocache"
-$env:GOMODCACHE = "F:\cache\go\pkg\mod"
+# Module cache must live INSIDE the workspace: the default (F:\cache) is
+# outside the writable sandbox area, so `go build` fails there with
+# "mkdir F:\cache\go\pkg\mod\cache\download\...: Access is denied".
+$env:GOMODCACHE = "F:\exeliang\KeyTalk\.gomodcache"
 $env:GOPROXY    = "off"
 $env:GOSUMDB    = "off"
 $env:GOFLAGS    = "-mod=mod"

@@ -17,6 +17,9 @@ identity.json
 /.gocache/
 /.gomodcache/
 
+# Spike/verification artifacts
+/.uitest-shot.png
+
 # Editor/OS noise
 .DS_Store
 Thumbs.db

@@ -57,6 +57,12 @@ type options struct {
 	// 存在理由：无此开关时，任何调用都会进入交互循环并阻塞 stdin，
 	// 使"生成身份/导入联系人"这类一次性操作无法在脚本中使用。
 	setupOnly bool
+
+	// gui 为 true 时使用 Gio 图形界面而非命令行 REPL。
+	//
+	// 两者共用同一套 core（下面的 runGUI 会新建一个 core.App），
+	// 因此加密与网络行为完全一致，只有呈现方式不同。
+	gui bool
 }
 
 func run() error {
@@ -67,6 +73,7 @@ func run() error {
 	flag.StringVar(&opt.contactFile, "contact", "", "导入联系人公钥文件（可重复用逗号分隔）")
 	flag.BoolVar(&opt.verbose, "v", false, "输出详细日志")
 	flag.BoolVar(&opt.setupOnly, "setup", false, "仅生成身份并导入联系人，然后退出（不进入聊天）")
+	flag.BoolVar(&opt.gui, "gui", false, "使用图形界面（默认使用命令行界面）")
 	flag.Parse()
 
 	if opt.name == "" {
@@ -192,6 +199,11 @@ func run() error {
 
 	mgr.Start(ctx)
 	defer mgr.Close()
+
+	// --- 5. 图形界面（-gui）或交互循环 ---
+	if opt.gui {
+		return runGUI(opt, identity, tr, contacts, logf)
+	}
 
 	// --- 5. 交互循环 ---
 	app := &app{

@@ -15,9 +15,9 @@
 | **S2** | `crypto` 包（纯离线） | — | ✅ 单元测试 | **进行中**（见下） |
 | **S3** | `wire` 包（纯离线） | — | ✅ 单元测试 + fuzz | **已完成** |
 | **S4** | `transport/lan` | S3 | ✅ 双实例互通 | **已完成**（含 20 个测试） |
-| **S5** | `session` + `core` 组装 | S2 S3 S4 | ✅ 双实例加密聊天 | **部分完成**（session 已通，core 未建） |
+| **S5** | `session` + `core` 组装 | S2 S3 S4 | ✅ 双实例加密聊天 | **完成**（core 已建，含 14 项缺陷修复） |
 | **S6** | `storage` 持久化 | S5 | ✅ 重启恢复 | 未开始 |
-| **S7** | 完整 UI | S5 S6 | ✅ 人工验收 | 未开始 |
+| **S7** | 完整 UI | S5 S6 | ✅ 人工验收 | **基本完成**（界面可用，持久化待 S6） |
 | **S8** | 移动端适配 | S1 S4 S7 | ✅ 真机验收 | 未开始 |
 | **S9** | 加固与审查 | 全部 | ✅ 清单 | 未开始 |
 | **S10** | 附件传输（二期） | S5 S6 | ✅ 双实例传文件 | 未开始 |
@@ -107,6 +107,78 @@
 > 在真实多网卡机器上反复运行"。`e2e.ps1` 因此不是可选项——
 > 它跑 8~12 次全绿，才有资格说"这条链路是稳的"。
 > 本机实测在这轮修复前后：**0/10 → 12/12**。
+
+### S5 已完成：`internal/core` 应用状态机
+
+`core` 是 UI 与协议层之间唯一的组装点。设计约束是"低耦合"：
+UI 只通过**命令（非阻塞）+ 事件（channel）** 两个面与它交互，
+不得直接触达 `transport` / `crypto`。
+
+界面（Gio，immediate mode）每一帧都会重读状态，因此：
+
+- **写**路径走单一事件循环（保证顺序、无数据竞争）；
+- **读**路径走带锁快照（保证 UI 线程永不阻塞）。
+
+对外接口（与 `docs/architecture.md` §3.4 一致）：
+
+```go
+// 命令（UI → core），全部非阻塞
+func (a *App) SendText(peerID, text string) error
+func (a *App) AddContact(name string, pubKey []byte, confirmed bool) (Contact, error)
+func (a *App) StartChat(peerID string) error
+func (a *App) Shutdown()
+
+// 事件（core → UI）
+func (a *App) Events() <-chan Event
+func (a *App) Snapshot() []Contact          // 只读快照，UI 每帧调用
+func (a *App) Messages(peerID string) []Message
+```
+
+**两个刻意的产品决策**（不是实现细节）：
+
+1. `AddContact` 要求调用方显式声明**已带外核对指纹**（`confirmed`）。
+   不提供"先添加、以后再核对"的路径——那会让用户习惯性跳过核对，
+   落进 TOFU 的典型失败模式（攻击者抢先连接即可长期冒名顶替）。
+2. `Config.Contacts` 非空但 `TrustedFingerprints` 为空时，**拒绝启动**。
+   宁可启动失败，也不要把"未核对"静默当成"已核对"。
+
+**在 `core` 上发现的真实缺陷**（均已修复）：
+
+11. **又出现了一次 `Events()` 双消费者**
+    `core` 和 `session.Manager` 同时读 `transport.Events()`，
+    再次随机瓜分帧。症状与第 8 条完全相同。
+    这次把规则**写进接口契约**（`transport.Transport` 的文档注释）：
+    `Events()` 只能有一个消费者，其他组件一律用 `Peers()` 轮询。
+
+12. **角色规则只在两个入口中的一个执行**
+    `handlePeerFound` 执行了角色判断，`StartChat`（用户点击）没有。
+    若点击早于发现事件到达，双方都会发起，各自以 responder 完成，
+    而本方的 initiator 分支永远等不到 ACK 直到超时。
+    修复：两个入口共用同一个 `shouldInitiate`。
+
+13. **glare 收敛仍不完整：双方都变成 responder**
+    这是第 7 条的后续。原修复只处理了"让出"分支，
+    但在"对方的 INIT 先于自己的 pending 到达"时，`hasPending` 为 false，
+    于是**不**让出、直接当 responder 并回 ACK。两边都如此，
+    就建立了**两条平行会话**：握手显示成功，消息却发到对方不认的链上。
+    实测约 **1/6** 概率复现。
+    修复：角色改为**纯函数**判定——指纹较大方**始终**是 initiator，
+    收到较小方的 INIT 时直接忽略，而不是顺手回 ACK。
+
+14. **`-race` 抓到的三个数据竞争**（都是真问题，非"良性竞争"）
+    - `crypto.zero()` 写包级全局 `escapeSink`：
+      除了竞争，该全局变量还**持有了刚被清零的密钥缓冲**，
+      抵消了清零想达到的"缩短密钥驻留"效果。
+      改用 `runtime.KeepAlive`。
+    - `lan.handleRecord` 在锁外读写 `lastPeerEmit` map：
+      Go 的 map 并发写会直接抛 `concurrent map writes` 崩溃。
+    - `lan.connFor` 解锁后读 `*PeerInfo.Addrs`，与 `handleRecord`
+      的 `append` 竞争；扩容时可能读到被替换掉的旧底层数组。
+      改为锁内深拷贝。
+
+> 第 14 条的经验：`go test ./... -race` 属于**提交前必跑**。
+> 上面三个里没有一个是"只是检测器在抱怨"——每个都会导致
+> 真实的错误行为，其中一个直接影响密钥的驻留时间。
 
 ### S2 当前进度（`crypto` 包）
 

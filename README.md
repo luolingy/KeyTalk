@@ -81,18 +81,32 @@ powershell -ExecutionPolicy Bypass -File .\e2e.ps1   # 一键端到端验证
 实测已验证：双向加密消息字节一致、30 条消息严格保序、陌生身份被拒绝、
 攻击尝试不影响合法流量。详见 [docs/running.md](docs/running.md)。
 
-已实现（`go test ./...` 全绿）：
+已实现（`go test ./...` 全绿，且 `-race` 全绿）：
 
 | 包 | 内容 |
 |---|---|
 | `internal/crypto` | 身份、KEM+AEAD 握手、前向保密、重放防护、密钥存储 |
 | `internal/wire` | 帧格式、明文消息编解码（含 fuzz 测试） |
 | `internal/transport/lan` | mDNS 发现、TCP 连接管理、背压 |
-| `internal/session` | 握手编排、事件循环、身份校验 |
+| `internal/session` | 握手编排、事件循环、身份校验、glare 收敛 |
+| `internal/core` | 应用状态机：联系人、会话生命周期、命令/事件接口 |
+| `internal/ui` | Gio 图形界面（侧栏 / 消息流 / 输入框 / 状态栏） |
 | `internal/e2e` | 四层串联的真实 TCP 回归测试 |
-| `cmd/keytalk` | 命令行聊天工具 |
+| `cmd/keytalk` | 聊天工具：命令行与图形界面（`-gui`）两个入口 |
 
-尚未实现：`internal/core`、`internal/storage`、`internal/files`、`internal/ui`。
+尚未实现：`internal/storage`、`internal/files`。
+
+```powershell
+go build -o keytalk.exe ./cmd/keytalk
+.\keytalk.exe -setup -name alice -id .\alice        # 生成身份与公钥
+.\keytalk.exe -gui -id .\alice                     # 图形界面
+.\keytalk.exe -id .\alice -contact .\bob\public.key   # 命令行界面
+```
+
+`internal/core` 是 UI 与协议层之间**唯一**的组装点：
+上层只通过「非阻塞命令 + 事件 channel + 只读快照」与它交互，
+不得直接调用 `transport` / `crypto`（见 [docs/architecture.md](docs/architecture.md) §1.1）。
+界面实现（S7）只依赖 `core`，因此可以独立更换。
 
 **下一阶段是 S7（Gio 界面）**，把命令行流程搬到真正的聊天窗口。
 在此之前建议先做 **S0 spike** 验证 Android mDNS（`MulticastLock`）——

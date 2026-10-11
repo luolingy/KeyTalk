@@ -216,7 +216,81 @@ th.Shaper = text.NewShaper(text.WithCollection(cjkCollection))
 
 **建议**：桌面端可在构建期嵌入子集字体；移动端若体积敏感，运行时尝试常见系统字体路径，失败则回退到嵌入子集。**这需要实测各平台路径**，属待定项。
 
-### 5.2 文本方向与富文本
+#### 5.1.1 实现结果（已验证）
+
+已按"运行时加载系统字体"实现，`internal/ui/fonts.go`：
+
+- 候选列表覆盖 Windows / macOS / Linux 常见路径，命中即用；
+- `opentype.ParseCollection` 解析（`.ttc` 是集合，会返回多个 face）；
+- **解析失败会记录告警并继续尝试下一个候选**，不静默放弃；
+- 全部失败时通过 `cjkFontStatus()` 在状态栏明确显示
+  "中文字体: 未找到（中文可能显示为方块）"。
+
+实测（Windows 10）：
+
+```
+CJK font loaded from C:\Windows\Fonts\msyh.ttc
+font collection has 14 face(s)     # gofont 的若干 face + 微软雅黑
+```
+
+**关键实现细节**：字体只解析**一次**（`sync.Once`）。
+`.ttc` 有十几 MB，每帧解析会立刻把 immediate-mode 的帧率拖垮。
+
+**测试**：`TestCJKFontIsLoaded` 在找不到字体时 **Skip 而非 Fail**——
+那是环境限制（精简 Linux 容器确实可能没有中文字体），
+不是代码缺陷。但**运行时必须告警**，绝不静默降级：
+用户看到满屏方块时应当能立刻知道原因。
+
+---
+
+## 5.3 其它实测到的 API 细节
+
+以下几处与设计文档的设想不同，记录以免重复踩坑：
+
+| 事项 | 实际情况 |
+|---|---|
+| `layout.Background` | `Layout(gtx, 背景, 内容)` **两个** widget，不是委托式单参数 |
+| `widget.Clickable` | 必须**跨帧持久**（结构体字段）。每帧 `new` 一个会让按钮永远收不到点击 |
+| `widget.Clickable.Cursor` | 不存在；光标形状需经 `pointer.Cursor` 的 op 栈 |
+| 填充背景 | 无 `fill` 原语，用 `paint.FillShape(ctx.Ops, c, clip.Rect{Max: sz}.Op())`；**用 Max 而非 Min**（Flexed 布局里 Min 可能是 0） |
+| 状态圆点 | `clip.Ellipse{Min, Max}.Op(gtx.Ops)` |
+
+### 5.3.1 一个隐蔽的"点了没反应"
+
+`widget.Clickable` 是**有状态**的：它需要在帧之间保留上一次的
+点击区域与按下状态。若写成
+
+```go
+btn := new(widget.Clickable)   // ❌ 每帧新建
+if btn.Clicked(gtx) { ... }
+```
+
+按钮**永远**不会触发。不会有编译错误，也不会有运行时错误——
+只是点下去毫无反应。本项目发送按钮因此把 `sendBtn` 作为
+`uiState` 的字段持久保存。
+
+---
+
+## 5.4 无窗口环境下的验证方式
+
+Gio 没有截图或内省接口，因此"界面画对了吗"无法直接断言。
+本项目的做法是**分层验证**：
+
+| 验证项 | 方式 |
+|---|---|
+| 窗口能否创建 | `cmd/uitest -d Ns`：开窗渲染 N 秒后自动退出 |
+| 中文字体是否加载 | `TestCJKFontIsLoaded`（可直接断言字体路径与 face 数） |
+| 文案是否面向用户 | `statusLabel` / `emptyContactsText` 的单测 |
+| 交互逻辑 | 抽成纯函数后单测（如 `statusColor` 不重复） |
+
+`cmd/uitest` 用"存活满 N 秒且无错误输出"作为通过标准——
+窗口创建失败或字体加载失败都会**立即**报错或崩溃，
+因此这是对那两个高风险假设的有效证据。
+
+它**不是**产品的一部分，存在的意义就是在投入完整界面之前
+把风险先验证掉。这类 spike 用完即应删除或明确标记。
+
+---
 
 - 首期只需从左到右的纯文本 + emoji。
 - Emoji 需要额外的彩色字体支持，Gio 的支持程度需实测；若不支持，emoji 会显示为单色或缺失。
