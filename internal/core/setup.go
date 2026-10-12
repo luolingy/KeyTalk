@@ -262,6 +262,27 @@ func (s *Setup) ImportIdentity(armored, passphrase, name string) error {
 // ErrSetupNotReady 表示身份尚未就绪。
 var ErrSetupNotReady = errors.New("core: identity is not ready yet")
 
+// GroupFingerprint 把指纹按四位分组，便于人工逐段比对。
+//
+// 界面不能直接调 crypto，因此在这里转发。
+func GroupFingerprint(fp string) string { return crypto.GroupHex(fp) }
+
+// ParsePublicKey 解析 armored 公钥，返回规范指纹。
+//
+// 存在的理由：界面必须在**写入任何状态之前**把指纹显示给用户
+// 做带外核对。让 ui 直接调 crypto 会破坏分层
+// （ui 不得直接依赖 crypto，见 docs/architecture.md §1.1），
+// 所以这里开一个只读入口。
+//
+// 无副作用：解析失败不改变任何状态。
+func ParsePublicKey(armored []byte) (string, error) {
+	_, fp, err := crypto.ImportPGPPublicKey(armored)
+	if err != nil {
+		return "", fmt.Errorf("这不是一个有效的公钥（需要 armored 文本）: %w", err)
+	}
+	return fp.String(), nil
+}
+
 // App 返回组装好的 App（首次调用时创建）。
 //
 // ⚠️ 会创建传输层并开始监听，可能耗时数十毫秒。

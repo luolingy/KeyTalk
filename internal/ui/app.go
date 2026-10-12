@@ -33,8 +33,37 @@ type Options struct {
 	// Logf 是界面的日志出口。
 	Logf func(string, ...any)
 
+	// Setup 是配置阶段（可选）。
+	//
+	// 提供时，界面先渲染"创建 / 导入 / 解锁身份"向导，
+	// 身份就绪后自动组装 App 并切换到主界面。
+	// 此时 App 应为 nil——两者互斥：有 App 就说明身份已就绪，
+	// 那就没有什么可配置的了。
+	Setup *core.Setup
+
+	// NetInfoFunc 返回网络层状态（可选）。
+	//
+	// 用函数而不是值：传输层是在配置阶段结束、App 组装时才
+	// 创建的，runGUI 拿到界面选项时还不知道端口号。
+	NetInfoFunc func() NetInfo
+
 	// Title 是窗口标题。
 	Title string
+}
+
+// NetInfo 是网络层的展示信息。
+//
+// 放在 ui 而不是 core：这些是**诊断信息**，不是协议状态。
+// 让 core 去暴露监听端口会迫使 transport.Transport 接口
+// 新增方法（并波及所有实现与测试），而界面只是想把它们显示出来。
+// 由 cmd 填进来最省事，也不破坏分层——cmd 本来就知道具体传输实现。
+type NetInfo struct {
+	// ListenAddr 是实际监听的地址（端口为 0 时是内核分配的端口）。
+	ListenAddr string
+	// DiscoveryActive 表示局域网自动发现是否可用。
+	DiscoveryActive bool
+	// DiscoveryError 在发现不可用时说明原因。
+	DiscoveryError string
 }
 
 // Run 创建窗口并进入事件循环，**阻塞**到窗口关闭。
@@ -43,8 +72,8 @@ type Options struct {
 // 因此本函数应当在单独的 goroutine 里调用，或者由 Run 负责启动
 // app.Main()（当前采用后者，见下）。
 func Run(opts Options) error {
-	if opts.App == nil {
-		return fmt.Errorf("ui: Options.App is required")
+	if opts.App == nil && opts.Setup == nil {
+		return fmt.Errorf("ui: Options.App or Options.Setup is required")
 	}
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
@@ -106,6 +135,35 @@ type uiState struct {
 
 	// showEmojiDetail 控制是否展开完整的 12 字节 SAS 十六进制。
 	showEmojiDetail bool
+
+	// su 是配置向导的可变状态（创建 / 导入 / 解锁）。
+	su setupState
+
+	// appStartErr 记录组装 App 失败的原因（端口占用、mDNS 起不来）。
+	//
+	// 与 su.errMsg 分开：那是"用户输入有问题"，
+	// 这是"环境有问题"，处置方式不同。
+	appStartErr string
+
+	// showInfo 控制配置信息面板。
+	showInfo bool
+
+	// showAddContact 控制"添加联系人"面板。
+	showAddContact bool
+
+	// ac 是添加联系人面板的状态。
+	ac addContactState
+
+	// infoScroll 让配置信息面板可以滚动。
+	infoScroll widget.List
+
+	// 面板入口按钮（必须跨帧持久，见 setupState 的注释）。
+	btnAddContact widget.Clickable
+	btnInfo       widget.Clickable
+	panelClose    widget.Clickable
+
+	// info 是配置信息面板的状态。
+	info infoState
 }
 
 func newState(opts Options) *uiState {
@@ -138,6 +196,7 @@ func newState(opts Options) *uiState {
 	a.composer.Submit = true
 	a.contactList.Axis = layout.Vertical
 	a.msgList.Axis = layout.Vertical
+	a.infoScroll.Axis = layout.Vertical
 	return a
 }
 
@@ -171,12 +230,21 @@ func (a *uiState) loop() error {
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
+			// 配置阶段先行：它可能在后台生成密钥、
+			// 并在就绪后组装 App。
+			a.pumpSetup()
 			// 先排空 core 事件，再绘制——顺序很重要：
 			// 若先绘制再排空，界面会永远比状态慢一帧，
 			// 表现为"刚发的消息要碰一下窗口才出现"。
 			a.drainEvents()
 			a.layout(gtx)
 			e.Frame(gtx.Ops)
+
+			// 后台操作进行中时必须主动请求下一帧，
+			// 否则界面停在"正在生成密钥…"，等用户动鼠标才更新。
+			if a.su.busy {
+				a.win.Invalidate()
+			}
 		}
 	}
 }
@@ -186,6 +254,9 @@ func (a *uiState) loop() error {
 // 必须**非阻塞**：core.Events() 是带缓冲的 channel，
 // 若这里用 for range 或阻塞 receive，界面会在无事件时卡死。
 func (a *uiState) drainEvents() {
+	if a.opts.App == nil {
+		return
+	}
 	for {
 		select {
 		case ev, ok := <-a.opts.App.Events():
@@ -247,6 +318,12 @@ func (a *uiState) handleEvent(ev core.Event) {
 //	│ 状态栏（字体状态 / 最近错误）              │
 //	└──────────────────────────────────────────┘
 func (a *uiState) layout(gtx layout.Context) {
+	// 身份尚未就绪：整体让位给配置向导。
+	if a.opts.App == nil {
+		a.layoutSetup(gtx)
+		return
+	}
+
 	fillRect(gtx, colorBackground, gtx.Constraints.Max)
 
 	contacts := a.opts.App.Snapshot()
@@ -262,6 +339,9 @@ func (a *uiState) layout(gtx layout.Context) {
 		layout.Rigid(vLineH),
 		layout.Rigid(a.statusBar),
 	)
+
+	// 浮层最后画，压在主体之上。
+	a.overlay(gtx)
 }
 
 // body 是主体：左栏联系人，右栏会话。

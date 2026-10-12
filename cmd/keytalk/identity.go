@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,91 +13,75 @@ import (
 	"github.com/exeliang/keytalk/internal/crypto"
 )
 
-// identityFile 是持久化的身份信息。
+// loadOrCreateIdentity 载入已有身份，或生成新的（仅供命令行模式）。
 //
-// ⚠️ 安全说明：当前版本把私钥以**明文**存盘。
+// # 为什么不再自己读写 identity.json
 //
-// 这是有意的阶段性简化，**不是**最终形态：
-// docs/crypto-protocol.md §10.2 设计的方案是
-// passphrase → argon2id → KEK → 解开 MK，再解密身份私钥。
-// internal/crypto/keystore.go 已经实现了这套机制，
-// 但接通它需要一个交互式口令输入界面（UI 阶段的工作）。
+// 磁盘格式由 crypto.IdentityStore 统一负责：命令行与图形界面
+// 必须读写**同一种**格式。此前两边各有一套实现，于是出现了
+// "图形界面建的 v2 加密身份，命令行读不了"——老代码只认 v1 的
+// 明文字段，遇到没有 private_key 的文件就报
+// "malformed payload: empty private key"。同一种文件、两套解析，
+// 必然迟早分叉。
 //
-// 在接通之前，这里会明确打印警告，绝不假装已经加密。
-type identityFile struct {
-	Version     int    `json:"version"`
-	Name        string `json:"name"`
-	Fingerprint string `json:"fingerprint"`
-	// PrivateKey 是 armored 私钥（**明文**，见上方警告）。
-	PrivateKey string `json:"private_key"`
-	// PublicKey 是 armored 公钥（可安全分发）。
-	PublicKey string `json:"public_key"`
+// # 口令从哪来
+//
+// 命令行模式没有交互式口令输入，因此：
+//   - 没有身份：建一份**明文**身份（e2e 脚本依赖这个行为）；
+//   - 有明文身份：直接载入；
+//   - 有加密身份：只有设置过 KEYTALK_PASSPHRASE 才能解锁。
+//
+// 口令走环境变量而不是命令行参数：参数会出现在进程列表里，
+// 同机器上任何用户都能看到。
+func loadOrCreateIdentity(dir, name string, logf func(string, ...any)) (*crypto.PGPProvider, bool, error) {
+	store := crypto.NewIdentityStore(dir)
+
+	meta, err := store.LoadMeta()
+
+	if errors.Is(err, crypto.ErrNoIdentity) {
+		if strings.TrimSpace(name) == "" {
+			name = "keytalk-user"
+		}
+		prov, err := store.CreateUnencrypted(name)
+		if err != nil {
+			return nil, false, fmt.Errorf("生成身份: %w", err)
+		}
+		logf("generated a plaintext identity at %s", store.Path())
+		warnPlaintextIdentity(store.Path())
+		return prov, true, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("读取 %s: %w", store.Path(), err)
+	}
+
+	pass := os.Getenv(passphraseEnv)
+	if meta.Encrypted && pass == "" {
+		return nil, false, fmt.Errorf(
+			"身份 %s 已用口令加密，而命令行模式无法交互式输入口令。\n"+
+				"  请改用图形界面（直接双击 keytalk.exe），\n"+
+				"  或先设置环境变量 %s 再重试。",
+			store.Path(), passphraseEnv)
+	}
+
+	prov, err := store.Unlock(pass)
+	if err != nil {
+		return nil, false, fmt.Errorf("解锁身份: %w", err)
+	}
+	if meta.LegacyPlaintext {
+		warnPlaintextIdentity(store.Path())
+	}
+	return prov, false, nil
 }
 
-// loadOrCreateIdentity 载入已有身份，或生成新的。
-func loadOrCreateIdentity(dir, name string, logf func(string, ...any)) (*crypto.PGPProvider, bool, error) {
-	path := filepath.Join(dir, "identity.json")
+// passphraseEnv 是命令行模式下提供口令的环境变量名。
+const passphraseEnv = "KEYTALK_PASSPHRASE"
 
-	if data, err := os.ReadFile(path); err == nil {
-		var idf identityFile
-		if err := json.Unmarshal(data, &idf); err != nil {
-			return nil, false, fmt.Errorf("解析 %s: %w", path, err)
-		}
-		prov, err := crypto.ImportPGPIdentity(idf.PrivateKey)
-		if err != nil {
-			return nil, false, fmt.Errorf("导入私钥: %w", err)
-		}
-		return prov, false, nil
-	} else if !os.IsNotExist(err) {
-		return nil, false, fmt.Errorf("读取 %s: %w", path, err)
-	}
-
-	// 生成新身份。
-	logf("生成新的 OpenPGP 身份…")
-	prov, err := crypto.GeneratePGPIdentity(crypto.PGPConfig{
-		Name:  name,
-		Email: name + "@keytalk.local",
-		// 2048 位：在兼容性与生成速度之间取平衡。
-		// x/crypto/openpgp 仅支持 RSA（见 crypto-protocol.md §10.4.1），
-		// 生产版应换 ProtonMail/go-crypto 以使用 Ed25519。
-		RSABits: 2048,
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("生成身份: %w", err)
-	}
-
-	priv, err := prov.ExportPrivateKey()
-	if err != nil {
-		return nil, false, fmt.Errorf("导出私钥: %w", err)
-	}
-
-	idf := identityFile{
-		Version:     1,
-		Name:        name,
-		Fingerprint: prov.Fingerprint().String(),
-		PrivateKey:  priv,
-		PublicKey:   string(prov.PublicKey()),
-	}
-	data, err := json.MarshalIndent(idf, "", "  ")
-	if err != nil {
-		return nil, false, err
-	}
-	// 0600：仅属主可读写。私钥文件权限不能放宽。
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return nil, false, fmt.Errorf("写入 %s: %w", path, err)
-	}
-
-	// 单独导出公钥，方便发给对方。
-	pubPath := filepath.Join(dir, "public.key")
-	if err := os.WriteFile(pubPath, []byte(idf.PublicKey), 0o644); err != nil {
-		return nil, false, fmt.Errorf("写入 %s: %w", pubPath, err)
-	}
-
-	fmt.Fprintf(os.Stderr, "\n⚠  私钥以明文存储在 %s\n", path)
-	fmt.Fprintf(os.Stderr, "   这是当前的阶段性简化。请勿在不受信任的机器上使用真实身份。\n")
-	fmt.Fprintf(os.Stderr, "   计划中的加密存储（argon2id 口令保护）尚未接通。\n\n")
-
-	return prov, true, nil
+// warnPlaintextIdentity 明确告知私钥正以明文存放。
+//
+// 绝不假装已经加密：用户有权知道自己的私钥在磁盘上是什么状态。
+func warnPlaintextIdentity(path string) {
+	fmt.Fprintf(os.Stderr, "\n⚠ 私钥以明文存放在 %s\n", path)
+	fmt.Fprintf(os.Stderr, "   这是命令行模式的过渡行为。双击启动图形界面可设置口令加密。\n\n")
 }
 
 // contact 是一个已验证的联系人。

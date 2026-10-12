@@ -158,6 +158,23 @@ func run() error {
 		}
 	}
 
+	// --- 图形界面 ---
+	//
+	// 刻意放在 CLI 身份加载**之前**。
+	//
+	// 图形模式的身份由 core.Setup 在界面里创建/解锁：可以让用户
+	// 设口令、可以从备份导入。若在这里先调用 loadOrCreateIdentity，
+	// 就会先斩后奏地落一份明文身份，向导随即进入"已就绪"，
+	// 用户再也没机会给私钥设口令。
+	//
+	// 也刻意放在创建命令行传输链路之前：旧写法是先建 lan 传输 +
+	// session.Manager，再由 gui 分支把它们整个丢弃、重新建一套，
+	// 于是凭空多出一个只在几百毫秒内存在的监听者，
+	// 排障时极易误判成"有两个实例"。
+	if opt.gui {
+		return runGUI(ctx, opt, logf)
+	}
+
 	identity, created, err := loadOrCreateIdentity(opt.dataDir, opt.name, logf)
 	if err != nil {
 		return fmt.Errorf("身份: %w", err)
@@ -202,17 +219,15 @@ func run() error {
 		return nil
 	}
 
-	// --- 图形界面 ---
+	// --- 命令行模式 ---
 	//
-	// 刻意放在创建命令行传输链路**之前**。
+	// 图形模式在上面已经返回。走到这里说明是命令行模式，
+	// 它需要一份**立刻可用**的身份，因此沿用"
+	// 没有就自动建一份明文身份"的老行为。
 	//
-	// 旧写法是先建 lan 传输 + session.Manager，再由 gui 分支把它们
-	// 整个丢弃、重新建一套。那样会短暂占用一个监听端口和一个 mDNS
-	// 名字——虽然能跑通，但等于凭空多出一个只在几百毫秒内存在的
-	// 监听者，排障时极易误判成"有两个实例"。
-	if opt.gui {
-		return runGUI(ctx, opt, identity, contacts, logf)
-	}
+	// 图形模式则相反：身份由界面里的向导创建，可以带口令。
+	// 两者不能共用一条路径——先自动建一份明文身份，
+	// 就等于让用户永远看不到口令保护这个选项。
 
 	if len(contacts) == 0 {
 		fmt.Println("\n⚠ 联系人列表为空。")

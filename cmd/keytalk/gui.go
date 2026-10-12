@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/exeliang/keytalk/internal/core"
 	"github.com/exeliang/keytalk/internal/crypto"
@@ -14,82 +15,127 @@ import (
 
 // runGUI 以图形界面运行。
 //
-// 它自己组装 transport 与 core.App，不复用命令行那套
-// session.Manager——因为 core 存在的意义正是把这些组装细节
-// 收敛到一处：命令行入口手工拼装 session.Manager，
-// 而图形入口只需要交给 core。两者最终跑的是同一套
-// crypto/transport 实现，行为一致。
+// # 与命令行入口的分工
 //
-// ⚠️ 契约提醒：core.App 内部会调用 transport.Events()。
-// 本函数**不得**再读同一个通道（见 transport.Transport 接口上的
-// "Events() 只能有一个消费者"）。在线状态由 core 轮询 Peers() 得出。
+// 命令行入口手工拼装 session.Manager；图形入口把组装交给 core。
+// 两者最终跑的是同一套 crypto/transport 实现，行为一致。
 //
-// 调用方 run() 已保证在进入本函数前**没有**创建过任何传输层，
-// 因此这里的 gtr 是唯一的监听者，不存在两个消费者抢帧的问题
-// （那个坑本项目踩过两次，见 docs/implementation-notes.md）。
-func runGUI(ctx context.Context, opt options, identity *crypto.PGPProvider,
-	contacts []contact, logf func(string, ...any)) error {
+// # 身份是延迟创建的
+//
+// 本函数**不**创建身份。身份由 core.Setup 在界面里创建、
+// 导入或解锁——这样用户才有机会给私钥设口令，也才能从备份恢复。
+// 传输层与 core.App 同样延迟到身份就绪后才建（见 BuildApp）。
+//
+// # 契约提醒
+//
+// core.App 内部会调用 transport.Events()。本函数**不得**再读
+// 同一个通道（见 transport.Transport 接口上的"Events() 只能有
+// 一个消费者"）。在线状态由 core 轮询 Peers() 得出。
+// 这个坑本项目踩过三次，因此 gtr 只在 BuildApp 里创建一次。
+func runGUI(ctx context.Context, opt options, logf func(string, ...any)) error {
 
-	fp := identity.Fingerprint()
-	logf("gui: starting with identity %s", fp.Display())
-
-	gtr := lan.New(lan.Config{
-		Fingerprint:     fp.String(),
-		DisplayName:     opt.name,
-		ListenPort:      opt.listenPort,
-		ProtocolVersion: "1",
-		Logf:            logf,
-	})
-	if err := gtr.Start(ctx); err != nil {
-		return fmt.Errorf("启动网络: %w", err)
-	}
-	defer func() { _ = gtr.Close() }()
-
-	// 组装 core 的配置。
+	// netState 记录传输层的诊断信息，供界面的"配置信息"面板显示。
 	//
-	// 关键：把**已核对**的指纹显式传入。
-	// core 会拒绝在"有联系人但未标记已核对"时启动——这是有意的：
-	// 本项目的产品决策是绝不静默信任未核对的身份。
-	cfgs := make([]core.ContactConfig, 0, len(contacts))
-	fps := make([]string, 0, len(contacts))
-	for _, c := range contacts {
-		cfgs = append(cfgs, core.ContactConfig{
-			Name:        c.name,
-			Fingerprint: c.fp.String(),
-			PublicKey:   c.pub,
-		})
-		// 联系人来自本地 contacts.json，即用户此前已通过
-		// 导入公钥的动作确认过。因此这里视为已核对。
-		fps = append(fps, c.fp.String())
-	}
+	// 用互斥锁保护：BuildApp 由界面 goroutine 调用，
+	// 而 NetInfoFunc 也在界面 goroutine 上被调用——理论上同属一个
+	// goroutine，但 core.Setup 未来可能改变调用时机，
+	// 加锁的代价可以忽略，漏掉它的代价是数据竞争。
+	var (
+		netMu        sync.Mutex
+		listenAddr   string
+		discoActive  bool
+		discoErrText string
+	)
 
-	app, err := core.New(core.Config{
-		Identity:            identity,
-		Importer:            &crypto.PGPImporter{},
-		Transport:           gtr,
-		Contacts:            cfgs,
-		TrustedFingerprints: fps,
-		Logf:                logf,
+	setup, err := core.NewSetup(core.SetupConfig{
+		DataDir: opt.dataDir,
+		Logf:    logf,
+		BuildApp: func(identity crypto.IdentityProvider,
+			contacts []core.ContactConfig, persist core.PersistFunc) (*core.App, error) {
+
+			fp := identity.Fingerprint()
+
+			gtr := lan.New(lan.Config{
+				Fingerprint:     fp.String(),
+				DisplayName:     opt.name,
+				ListenPort:      opt.listenPort,
+				ProtocolVersion: "1",
+				Logf:            logf,
+			})
+			if err := gtr.Start(ctx); err != nil {
+				return nil, fmt.Errorf("启动网络: %w", err)
+			}
+
+			netMu.Lock()
+			listenAddr = gtr.LocalAddr().String()
+			discoActive = gtr.DiscoveryActive()
+			if !discoActive {
+				// 如实报告，绝不宣称一个没有运行的功能。
+				discoErrText = fmt.Sprintf("%v", gtr.DiscoveryError())
+				logf("gui: WARNING mDNS discovery unavailable: %v", gtr.DiscoveryError())
+			}
+			netMu.Unlock()
+
+			// 关键：把**已核对**的指纹显式传入。
+			// core 会拒绝在"有联系人但未标记已核对"时启动——这是有意的：
+			// 本项目的产品决策是绝不静默信任未核对的身份。
+			//
+			// 联系人要么来自本地 contacts.json（即用户此前导入公钥时
+			// 确认过），要么来自界面里勾选了"已核对指纹"的添加动作。
+			// 两条路都经过用户确认，因此这里全部视为已核对。
+			fps := make([]string, 0, len(contacts))
+			for _, c := range contacts {
+				fps = append(fps, c.Fingerprint)
+			}
+
+			app, err := core.New(core.Config{
+				Identity:            identity,
+				Importer:            &crypto.PGPImporter{},
+				Transport:           gtr,
+				Contacts:            contacts,
+				TrustedFingerprints: fps,
+				Persist:             persist,
+				Logf:                logf,
+			})
+			if err != nil {
+				// 关掉刚起来的传输层，否则监听端口会泄漏到进程退出。
+				_ = gtr.Close()
+				return nil, fmt.Errorf("初始化 core: %w", err)
+			}
+
+			logf("gui: app ready, fingerprint %s, listening %s", fp.Display(), listenAddr)
+			return app, nil
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("初始化 core: %w", err)
+		return fmt.Errorf("初始化配置阶段: %w", err)
 	}
-	defer app.Shutdown()
+	defer setup.Close()
 
-	if len(contacts) == 0 {
-		fmt.Println("提示：尚无联系人。界面中会说明如何与对方交换公钥。")
+	// 控制台上说清楚这一屏会做什么，方便命令行启动时排查。
+	fmt.Printf("数据目录: %s\n", opt.dataDir)
+	switch setup.Stage() {
+	case core.StageNeedsIdentity:
+		fmt.Println("尚无身份：界面中会引导你创建或从备份导入。")
+	case core.StageNeedsUnlock:
+		fmt.Println("身份已加密：界面中需要输入口令解锁。")
+	default:
+		fmt.Println("身份已就绪。")
 	}
-	if !gtr.DiscoveryActive() {
-		// 如实报告，绝不宣称一个没有运行的功能。
-		fmt.Printf("警告：mDNS 发现不可用（%v）。\n", gtr.DiscoveryError())
-		fmt.Println("      无法自动发现对端；若对方主动连接仍可通信。")
-	}
-
-	fmt.Printf("本机指纹: %s\n", fp.Display())
 
 	return ui.Run(ui.Options{
-		App:   app,
+		// App 故意留空：由 Setup 在身份就绪后组装。
+		Setup: setup,
 		Title: "KeyTalk",
 		Logf:  logf,
+		NetInfoFunc: func() ui.NetInfo {
+			netMu.Lock()
+			defer netMu.Unlock()
+			return ui.NetInfo{
+				ListenAddr:      listenAddr,
+				DiscoveryActive: discoActive,
+				DiscoveryError:  discoErrText,
+			}
+		},
 	})
 }

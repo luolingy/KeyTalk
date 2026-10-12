@@ -72,6 +72,10 @@ func (a *uiState) trustBar(gtx layout.Context, contacts []core.Contact) layout.D
 					)
 				}),
 				layout.Rigid(layout.Spacer{Width: unit.Dp(16)}.Layout),
+				// 面板入口。放在这里而不是设置菜单里：
+				// "添加联系人"是本应用最常用的动作，
+				// 藏起来会让第一步就卡住。
+				layout.Rigid(a.panelButtons),
 				// 右侧本机指纹：常驻可见，不需要点开设置。
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return a.localFingerprint(gtx)
@@ -101,7 +105,7 @@ func (a *uiState) identityBar(gtx layout.Context) layout.Dimensions {
 					lbl.Color = colorMuted
 					return lbl.Layout(gtx)
 				}),
-				layout.Rigid(layout.Spacer{Width: unit.Dp(16)}.Layout),
+				layout.Rigid(a.panelButtons),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return a.localFingerprint(gtx)
 				}),
