@@ -115,6 +115,25 @@ func GroupHex(s string) string {
 // 指纹字典序是全序，因此双方必得出**一致且互斥**的角色结论。
 func (f Fingerprint) Less(other Fingerprint) bool { return string(f) < string(other) }
 
+// ParseFingerprint 解析用户输入或文件里的指纹。
+//
+// 接受四位分组空格与小写：指纹是给人读的，要求用户自己去掉空格
+// 或改成大写是没有理由的苛刻。一律规范化为大写无分隔形式，
+// 使后续比较永远在同一个表示上进行。
+//
+// ⚠️ 只做格式校验，**不**验证长度或校验和——
+// 指纹是否对应某把真实密钥，只能由实际导入公钥来断定。
+func ParseFingerprint(s string) (Fingerprint, error) {
+	clean := strings.ToUpper(strings.Join(strings.Fields(s), ""))
+	if clean == "" {
+		return "", errors.New("crypto: empty fingerprint")
+	}
+	if _, err := hex.DecodeString(clean); err != nil {
+		return "", fmt.Errorf("crypto: fingerprint is not valid hex: %w", err)
+	}
+	return Fingerprint(clean), nil
+}
+
 // randomBytes 读取密码学安全随机数。失败即 panic —— rand.Read 失败意味着
 // 系统熵源已不可用，此时继续运行会生成可预测的密钥，必须立即中止。
 func randomBytes(n int) []byte {

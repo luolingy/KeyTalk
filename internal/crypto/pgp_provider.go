@@ -171,6 +171,22 @@ func fingerprinOf(e *openpgp.Entity) Fingerprint {
 // Fingerprint 返回完整指纹。
 func (p *PGPProvider) Fingerprint() Fingerprint { return p.fp }
 
+// Name 返回身份里的用户名。
+//
+// 用途：从备份导入身份时预填显示名，省去用户手输。
+//
+// 注意 Identities 是 map，迭代顺序随机。本项目的密钥只有一个
+// user id，因此结果确定；若将来支持多个，这里需要改为
+// 选取主 user id（自签名指向的那个）。
+func (p *PGPProvider) Name() string {
+	for _, id := range p.entity.Identities {
+		if id != nil && id.UserId != nil && id.UserId.Name != "" {
+			return id.UserId.Name
+		}
+	}
+	return ""
+}
+
 // PublicKey 返回 armored 公钥文本（可安全分发给对端）。
 func (p *PGPProvider) PublicKey() []byte {
 	var buf bytes.Buffer

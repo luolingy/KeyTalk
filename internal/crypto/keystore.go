@@ -254,6 +254,12 @@ const (
 	PurposeFileKey LocalDataPurpose = "file-key"
 	// PurposeMIME 是附件 MIME 类型。
 	PurposeMIME LocalDataPurpose = "file-mime"
+
+	// PurposeIdentityKey 是身份私钥（armored）本身。
+	//
+	// 单独的用途标签让私钥密文无法被搬到消息正文或附件的位置使用：
+	// AAD 不同，解密必然失败（跨用途混淆防护）。
+	PurposeIdentityKey LocalDataPurpose = "identity-private-key"
 )
 
 func purposeAAD(p LocalDataPurpose) []byte {
