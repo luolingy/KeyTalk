@@ -243,6 +243,14 @@ type Config struct {
 	// EventBuffer 是事件 channel 的缓冲大小（0 用默认值）。
 	EventBuffer int
 
+	// Persist 在联系人列表发生变化时被调用，用来写回磁盘。
+	//
+	// 为 nil 时不持久化——测试与只读场景用。
+	// 注意这里的顺序约定：**先落盘，再改内存**。
+	// 反过来会出现"界面显示已添加、重启后消失"，
+	// 那种不一致比直接报错更难查。
+	Persist PersistFunc
+
 	// Logf 是底层组件的日志出口（可选）。
 	Logf func(string, ...any)
 }
@@ -644,6 +652,27 @@ func (a *App) AddContact(name string, armoredPubKey []byte, fingerprintConfirmed
 		Name:        name,
 		Fingerprint: id,
 		PublicKey:   armoredPubKey,
+	}
+
+	// 先落盘，再登记进会话层。
+	//
+	// 顺序不能反：反过来就得在失败时回滚会话层登记，
+	// 一旦漏掉，这个联系人会在**本次运行**里可以握手，
+	// 重启后却消失——一个只在当前进程里存在的信任关系。
+	if a.cfg.Persist != nil {
+		a.mu.RLock()
+		next := make([]ContactConfig, 0, len(a.order)+1)
+		for _, cid := range a.order {
+			if st, ok := a.contacts[cid]; ok {
+				next = append(next, st.cfg)
+			}
+		}
+		a.mu.RUnlock()
+		next = append(next, cfg)
+
+		if err := a.cfg.Persist(next); err != nil {
+			return Contact{}, fmt.Errorf("保存联系人失败（未添加任何联系人）: %w", err)
+		}
 	}
 
 	// 注册进会话层——必须在投递命令**之前**完成，
