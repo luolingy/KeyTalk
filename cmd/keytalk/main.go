@@ -39,10 +39,28 @@ import (
 )
 
 func main() {
+	// ⚠️ 必须在任何输出之前：双击启动时 Windows 会先新建一个
+	// 控制台窗口，我们要在它被看到之前藏起来。
+	// 从终端启动时不会隐藏——那个窗口是用户的终端。
+	hideOwnConsole(len(os.Args) <= 1)
+
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "\n错误: %v\n", err)
+		reportFatal(err)
 		os.Exit(1)
 	}
+}
+
+// reportFatal 把致命错误送到用户**真能看到**的地方。
+//
+// 图形模式下控制台是隐藏的，往 stderr 写等于什么也没说，
+// 程序表现为"闪一下就没了"。那种情况必须弹窗——否则用户
+// 只知道它坏了，不知道坏在哪。
+func reportFatal(err error) {
+	if consoleHidden {
+		messageBox("KeyTalk 启动失败", err.Error())
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n错误: %v\n", err)
 }
 
 // options 是命令行参数。
@@ -69,13 +87,28 @@ type options struct {
 func run() error {
 	var opt options
 	flag.StringVar(&opt.name, "name", "", "显示名（默认用系统用户名）")
-	flag.StringVar(&opt.dataDir, "id", "./keytalk-data", "身份与数据目录")
+	// 默认留空，稍后按"显式指定 > 已有 ./keytalk-data > 系统配置目录"
+	// 解析（见 resolveDataDir）。
+	flag.StringVar(&opt.dataDir, "id", "", "身份与数据目录（默认放到系统用户配置目录）")
 	flag.IntVar(&opt.listenPort, "port", 0, "TCP 监听端口（0 = 自动分配）")
 	flag.StringVar(&opt.contactFile, "contact", "", "导入联系人公钥文件（可重复用逗号分隔）")
 	flag.BoolVar(&opt.verbose, "v", false, "输出详细日志")
 	flag.BoolVar(&opt.setupOnly, "setup", false, "仅生成身份并导入联系人，然后退出（不进入聊天）")
 	flag.BoolVar(&opt.gui, "gui", false, "使用图形界面（默认使用命令行界面）")
 	flag.Parse()
+
+	// 无参数的裸启动 = 双击启动。
+	//
+	// 此时用户期望的是"打开程序"，而不是面对一个需要输入命令的
+	// 提示符。传了参数就维持命令行行为——e2e.ps1 等脚本全都依赖
+	// 这一点，因此不能把图形界面变成无条件默认。
+	if len(os.Args) <= 1 {
+		opt.gui = true
+	}
+
+	if opt.dataDir == "" {
+		opt.dataDir = resolveDataDir("")
+	}
 
 	if opt.name == "" {
 		if u := os.Getenv("USERNAME"); u != "" {
@@ -90,9 +123,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 日志有三个出口：终端详细输出（-v）、图形模式的日志文件，
+	// 以及由 core 转发到界面状态栏的事件。
+	var logFile *os.File
+
 	logf := func(format string, args ...any) {
 		if opt.verbose {
 			fmt.Printf("  · "+format+"\n", args...)
+		}
+		if logFile != nil {
+			fmt.Fprintf(logFile, format+"\n", args...)
 		}
 	}
 
@@ -101,7 +141,21 @@ func run() error {
 	fmt.Println(strings.Repeat("=", 60))
 
 	if err := os.MkdirAll(opt.dataDir, 0o700); err != nil {
-		return fmt.Errorf("创建数据目录: %w", err)
+		return fmt.Errorf("创建数据目录 %s: %w", opt.dataDir, err)
+	}
+
+	// 图形模式下控制台可能是隐藏的（双击启动），出了问题用户
+	// 手上不会有任何可排查的信息。因此把日志同时写进数据目录。
+	//
+	// 命令行模式不写文件：脚本靠 stdout，多一个日志文件
+	// 只会让人困惑到底该看哪个。
+	if opt.gui {
+		if f, ferr := os.OpenFile(filepath.Join(opt.dataDir, "keytalk.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); ferr == nil {
+			logFile = f
+			defer f.Close()
+			logf("--- keytalk gui start ---")
+		}
 	}
 
 	identity, created, err := loadOrCreateIdentity(opt.dataDir, opt.name, logf)
@@ -118,6 +172,9 @@ func run() error {
 	}
 	fmt.Printf("  显示名: %s\n", opt.name)
 	fmt.Printf("  指纹:   %s\n", fp.Display())
+	// 数据目录必须明说：用户的身份私钥和公钥都在这里，
+	// 而他多半不会想到去 %AppData% 下面找。
+	fmt.Printf("  数据目录: %s\n", opt.dataDir)
 
 	// --- 2. 联系人 ---
 	contacts, err := loadContacts(opt.dataDir, logf)
@@ -143,6 +200,18 @@ func run() error {
 			}
 		}
 		return nil
+	}
+
+	// --- 图形界面 ---
+	//
+	// 刻意放在创建命令行传输链路**之前**。
+	//
+	// 旧写法是先建 lan 传输 + session.Manager，再由 gui 分支把它们
+	// 整个丢弃、重新建一套。那样会短暂占用一个监听端口和一个 mDNS
+	// 名字——虽然能跑通，但等于凭空多出一个只在几百毫秒内存在的
+	// 监听者，排障时极易误判成"有两个实例"。
+	if opt.gui {
+		return runGUI(ctx, opt, identity, contacts, logf)
 	}
 
 	if len(contacts) == 0 {
@@ -200,11 +269,6 @@ func run() error {
 
 	mgr.Start(ctx)
 	defer mgr.Close()
-
-	// --- 5. 图形界面（-gui）或交互循环 ---
-	if opt.gui {
-		return runGUI(opt, identity, tr, contacts, logf)
-	}
 
 	// --- 5. 交互循环 ---
 	app := &app{

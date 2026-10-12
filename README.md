@@ -69,13 +69,20 @@
 
 ## 项目状态
 
-**可运行的加密闭环已打通**（S3/S4/S5 完成，S7 界面未开始）。
+**可运行的加密闭环已打通**（S3/S4/S5/S7 完成）。
 
-现在就能跑起来：两个进程通过 mDNS 互相发现、完成带前向保密的握手、
-互发端到端加密消息。入口是**命令行**工具，因为图形界面尚未实现。
+一键构建出双击即用的可执行文件：
 
 ```powershell
-go build -o keytalk.exe ./cmd/keytalk     # 需先设 GOCACHE，见 docs/running.md
+.\build.ps1              # 产出 dist\keytalk.exe（含冒烟自检）
+.\build.ps1 -Run         # 构建后立即启动
+```
+
+双击 `dist\keytalk.exe` 即开界面，数据自动落在
+`%AppData%\KeyTalk`。同一个文件传参数就是命令行工具，
+脚本与排错不受影响。
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\e2e.ps1   # 一键端到端验证
 ```
 
@@ -93,15 +100,19 @@ powershell -ExecutionPolicy Bypass -File .\e2e.ps1   # 一键端到端验证
 | `internal/core` | 应用状态机：联系人、会话生命周期、命令/事件接口 |
 | `internal/ui` | Gio 图形界面（侧栏 / 消息流 / 输入框 / 状态栏） |
 | `internal/e2e` | 四层串联的真实 TCP 回归测试 |
-| `cmd/keytalk` | 聊天工具：命令行与图形界面（`-gui`）两个入口 |
+| `cmd/keytalk` | 聊天工具：双击启动图形界面，带参数则是命令行工具 |
 
 尚未实现：`internal/storage`、`internal/files`。
 
 ```powershell
+.\build.ps1                                        # 一键构建（推荐）
+# 或手工构建：
 go build -o keytalk.exe ./cmd/keytalk
+
+.\keytalk.exe                                       # 双击等价：图形界面 + 自动生成身份
 .\keytalk.exe -setup -name alice -id .\alice        # 生成身份与公钥
-.\keytalk.exe -gui -id .\alice                     # 图形界面
-.\keytalk.exe -id .\alice -contact .\bob\public.key   # 命令行界面
+.\keytalk.exe -gui -id .\alice                      # 指定数据目录的图形界面
+.\keytalk.exe -id .\alice -contact .\bob\public.key # 命令行界面
 ```
 
 `internal/core` 是 UI 与协议层之间**唯一**的组装点：

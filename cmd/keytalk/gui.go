@@ -8,31 +8,27 @@ import (
 
 	"github.com/exeliang/keytalk/internal/core"
 	"github.com/exeliang/keytalk/internal/crypto"
-	"github.com/exeliang/keytalk/internal/transport"
 	"github.com/exeliang/keytalk/internal/transport/lan"
 	"github.com/exeliang/keytalk/internal/ui"
 )
 
 // runGUI 以图形界面运行。
 //
-// 它**重建**一个 core.App，而不是复用 REPL 那套 session.Manager——
-// 因为 core 的目的正是把这些组装细节收敛到一处：
-// 命令行入口手工组装 session.Manager，而图形入口只需交给 core。
-// 两者最终使用同一套 crypto/transport 实现，行为一致。
+// 它自己组装 transport 与 core.App，不复用命令行那套
+// session.Manager——因为 core 存在的意义正是把这些组装细节
+// 收敛到一处：命令行入口手工拼装 session.Manager，
+// 而图形入口只需要交给 core。两者最终跑的是同一套
+// crypto/transport 实现，行为一致。
 //
 // ⚠️ 契约提醒：core.App 内部会调用 transport.Events()。
 // 本函数**不得**再读同一个通道（见 transport.Transport 接口上的
 // "Events() 只能有一个消费者"）。在线状态由 core 轮询 Peers() 得出。
-func runGUI(opt options, identity *crypto.PGPProvider, tr transport.Transport,
+//
+// 调用方 run() 已保证在进入本函数前**没有**创建过任何传输层，
+// 因此这里的 gtr 是唯一的监听者，不存在两个消费者抢帧的问题
+// （那个坑本项目踩过两次，见 docs/implementation-notes.md）。
+func runGUI(ctx context.Context, opt options, identity *crypto.PGPProvider,
 	contacts []contact, logf func(string, ...any)) error {
-
-	// tr 由调用方（run）创建并 defer 关闭；这里不能重复 Start。
-	// 但它已经被 session.Manager 消费过 Events()，因此不能交给 core。
-	// 为保持"单消费者"约束，这里关闭它并新建一条干净的生命周期。
-	//
-	// 若直接复用，会出现两个消费者抢帧——那正是本项目踩过两次的坑。
-	// 与其让 core 去适配一个已被消费的传输，不如在此显式重建。
-	_ = tr
 
 	fp := identity.Fingerprint()
 	logf("gui: starting with identity %s", fp.Display())
@@ -44,7 +40,7 @@ func runGUI(opt options, identity *crypto.PGPProvider, tr transport.Transport,
 		ProtocolVersion: "1",
 		Logf:            logf,
 	})
-	if err := gtr.Start(context.Background()); err != nil {
+	if err := gtr.Start(ctx); err != nil {
 		return fmt.Errorf("启动网络: %w", err)
 	}
 	defer func() { _ = gtr.Close() }()
