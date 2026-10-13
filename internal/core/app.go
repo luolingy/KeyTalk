@@ -2,12 +2,15 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 
 	"github.com/exeliang/keytalk/internal/crypto"
 	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
+	"github.com/exeliang/keytalk/internal/storage"
 	"github.com/exeliang/keytalk/internal/transport"
 )
 
@@ -517,42 +520,158 @@ func (a *App) shouldInitiate(peerID string) bool {
 	return own > peerID
 }
 
+// newMessageID 生成全局唯一的消息 ID。
+//
+// 早期用进程内自增的 "m1"、"m2"……。落盘之后这是**错的**：
+// 重启再发一条又会得到 "m1"，与历史记录撞号，
+// 而日志按"同 ID 取最后一次"折叠，于是新消息会把旧消息顶掉。
+//
+// 用随机数而不是时间戳：同一毫秒内连发两条不会撞，
+// 系统时钟回拨也不会撞。
+func newMessageID() string {
+	var b [12]byte
+	// rand.Read 失败意味着系统熵源不可用。此时生成的 ID 可预测，
+	// 而可预测的 ID 会被冒充的消息顶替，因此直接中止。
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("core: message id: " + err.Error())
+	}
+	return "m" + hex.EncodeToString(b[:])
+}
+
 // recordMessage 记录一条消息，返回其快照。
 func (a *App) recordMessage(peerID, text string, outgoing bool) Message {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.seq++
 	msg := Message{
-		ID:       fmt.Sprintf("m%d", a.seq),
+		ID:       newMessageID(),
 		PeerID:   peerID,
 		Outgoing: outgoing,
 		Text:     text,
 		SentAt:   time.Now(),
 		Pending:  outgoing,
+		State:    MessageStatePending,
 	}
+	if !outgoing {
+		// 入站消息收到即终态。
+		msg.Pending = false
+		msg.State = MessageStateReceived
+	}
+
+	a.mu.Lock()
 	a.messages[peerID] = append(a.messages[peerID], msg)
+	a.mu.Unlock()
+
+	// 落盘放在锁外：文件 IO 不应阻塞界面读取快照。
+	a.persist(msg)
 	return msg
 }
 
-// markMessageSent 清除消息的 Pending 标记。
-func (a *App) markMessageSent(id string) { a.updatePending(id, false) }
+// markMessageSent 把消息标记为已交给传输层。
+func (a *App) markMessageSent(id string) { a.updateState(id, MessageStateSent) }
 
 // markMessageFailed 保留消息但标记为不再重试。
 //
 // 不删除：用户需要看到"这条没发出去"，静默丢弃是最糟的选择。
-func (a *App) markMessageFailed(id string) { a.updatePending(id, false) }
+//
+// 注意这条路径以前和 markMessageSent 一样只清 Pending，
+// 于是"发送失败"和"已发送"在状态上完全无法区分，
+// 重启之后一条根本没发出去的消息会显示成已发送。
+func (a *App) markMessageFailed(id string) { a.updateState(id, MessageStateFailed) }
 
-func (a *App) updatePending(id string, pending bool) {
+// updateState 改写一条消息的状态并落盘。
+func (a *App) updateState(id string, state MessageState) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	var updated Message
+	found := false
 	for _, list := range a.messages {
 		for i := range list {
 			if list[i].ID == id {
-				list[i].Pending = pending
-				return
+				list[i].State = state
+				list[i].Pending = state == MessageStatePending
+				updated = list[i]
+				found = true
+				break
 			}
 		}
+		if found {
+			break
+		}
+	}
+	a.mu.Unlock()
+
+	if found {
+		a.persist(updated)
+	}
+}
+
+// persist 把一条消息写入持久化层。
+//
+// 失败只记录、不上报为错误：消息已经在内存里、界面已经显示了，
+// 把它变成发送失败会掩盖真正的情况（消息其实已经发出去了）。
+// 但**必须**留痕——历史悄悄丢失是用户会去查的事。
+func (a *App) persist(msg Message) {
+	if a.cfg.Store == nil {
+		return
+	}
+	rec := storage.MessageRecord{
+		ID:       msg.ID,
+		PeerFP:   msg.PeerID,
+		Outgoing: msg.Outgoing,
+		Text:     msg.Text,
+		SentAt:   msg.SentAt,
+		State:    storeStateOf(msg.State),
+	}
+	if err := a.cfg.Store.Append(rec); err != nil {
+		a.cfg.Logf("core: persisting message %s failed: %v", msg.ID, err)
+	}
+}
+
+// storeStateOf 把 core 的消息状态映射到存储层的状态。
+func storeStateOf(s MessageState) int {
+	switch s {
+	case MessageStatePending:
+		return storage.StatePending
+	case MessageStateFailed:
+		return storage.StateFailed
+	default:
+		// Sent 与 Received 都落到"已送达"。
+		return storage.StateSent
+	}
+}
+
+// restoreHistory 把磁盘上的历史装回内存。
+func (a *App) restoreHistory(recs []storage.MessageRecord) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, r := range recs {
+		// 只恢复仍在联系人表里的会话。联系人被删掉之后继续
+		// 保留其历史，等于让"已删除的联系人"以另一种方式存在。
+		if _, ok := a.contacts[r.PeerFP]; !ok {
+			continue
+		}
+
+		state := MessageStateSent
+		switch r.State {
+		case storage.StateFailed:
+			state = MessageStateFailed
+		case storage.StatePending:
+			// 上次进程在这条消息发出去之前就结束了。本版本没有
+			// 重发机制，因此按"失败"恢复——**不**假装它已经发出。
+			// 显示成已发送会让用户以为对方看到了。
+			state = MessageStateFailed
+		}
+		if !r.Outgoing {
+			state = MessageStateReceived
+		}
+
+		a.messages[r.PeerFP] = append(a.messages[r.PeerFP], Message{
+			ID:       r.ID,
+			PeerID:   r.PeerFP,
+			Outgoing: r.Outgoing,
+			Text:     r.Text,
+			SentAt:   r.SentAt,
+			Pending:  false,
+			State:    state,
+		})
 	}
 }
 

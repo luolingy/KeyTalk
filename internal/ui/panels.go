@@ -395,6 +395,9 @@ func (a *uiState) infoPanel(gtx layout.Context) layout.Dimensions {
 			return a.infoRow(gtx, "联系人", fmt.Sprintf("%d 个", len(a.opts.App.Snapshot())))
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return a.infoRow(gtx, "消息存储", a.messageStorageText())
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return a.infoRow(gtx, "中文字体", a.fontMsg)
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
@@ -553,6 +556,21 @@ func (a *uiState) keyProtectionText() string {
 		return "已用口令加密（argon2id + ChaCha20-Poly1305）"
 	}
 	return "未知"
+}
+
+// messageStorageText 说明消息是否落盘。
+//
+// 明文身份没有主密钥，因此**没有**消息历史。这件事必须说出来：
+// 用户会以为聊天记录和别的程序一样自动保存，
+// 关掉窗口才发现什么都没有。
+func (a *uiState) messageStorageText() string {
+	if a.opts.Setup == nil {
+		return "未知"
+	}
+	if a.opts.Setup.HasMessageStore() {
+		return "已启用（正文用口令派生的主密钥加密）"
+	}
+	return "⚠️ 未启用 —— 身份没有口令，无法加密落盘；消息不会保存"
 }
 
 // netInfo 读取网络层状态。

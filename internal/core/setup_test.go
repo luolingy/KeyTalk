@@ -18,11 +18,11 @@ const setupPass = "a sufficiently long passphrase"
 // 用真传输层而不是假实现：本文件测的是"配置阶段能否交出可用的 App"，
 // 而"可用"的定义就是 core.New 接受它——里面包含对
 // TrustedFingerprints 覆盖度的检查。假传输会绕过这些检查。
-func testBuildApp(t *testing.T) func(crypto.IdentityProvider, []ContactConfig, PersistFunc) (*App, error) {
+func testBuildApp(t *testing.T) func(SetupSession) (*App, error) {
 	t.Helper()
-	return func(id crypto.IdentityProvider, contacts []ContactConfig, persist PersistFunc) (*App, error) {
+	return func(sess SetupSession) (*App, error) {
 		tr := lan.New(lan.Config{
-			Fingerprint: id.Fingerprint().String(),
+			Fingerprint: sess.Identity.Fingerprint().String(),
 			DisplayName: "test",
 			ListenPort:  0,
 		})
@@ -30,18 +30,19 @@ func testBuildApp(t *testing.T) func(crypto.IdentityProvider, []ContactConfig, P
 			return nil, err
 		}
 
-		fps := make([]string, 0, len(contacts))
-		for _, c := range contacts {
+		fps := make([]string, 0, len(sess.Contacts))
+		for _, c := range sess.Contacts {
 			fps = append(fps, c.Fingerprint)
 		}
 
 		app, err := New(Config{
-			Identity:            id,
+			Identity:            sess.Identity,
 			Importer:            &crypto.PGPImporter{},
 			Transport:           tr,
-			Contacts:            contacts,
+			Contacts:            sess.Contacts,
 			TrustedFingerprints: fps,
-			Persist:             persist,
+			Persist:             sess.Persist,
+			Store:               sess.Store,
 			Logf:                func(string, ...any) {},
 		})
 		if err != nil {

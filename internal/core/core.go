@@ -36,6 +36,7 @@ import (
 	"github.com/exeliang/keytalk/internal/crypto"
 	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
+	"github.com/exeliang/keytalk/internal/storage"
 	"github.com/exeliang/keytalk/internal/transport"
 )
 
@@ -154,8 +155,36 @@ type Message struct {
 	// SentAt 是发送/接收时间。
 	SentAt time.Time
 	// Pending 表示消息尚未确认送达（仅出站有意义）。
+	//
+	// 保留它是为了兼容既有界面代码；新代码应当看 State，
+	// 因为 Pending 分不出"已发送"和"发送失败"。
 	Pending bool
+	// State 是投递状态，见 MessageState。
+	State MessageState
 }
+
+// MessageState 描述一条消息的投递状态。
+//
+// 数值刻意与 storage 层一致（0/1/2），转换是恒等的，
+// 不需要一张容易写错的映射表。
+type MessageState int
+
+const (
+	// MessageStatePending 尚未确认交给传输层（仅出站有意义）。
+	MessageStatePending MessageState = 0
+	// MessageStateSent 已交给传输层。
+	//
+	// ⚠️ **不**表示对方已收到：纯 P2P 下没有送达回执，
+	// 界面不能把它显示成"已读"。
+	MessageStateSent MessageState = 1
+	// MessageStateFailed 发送失败，不再重试。
+	MessageStateFailed MessageState = 2
+	// MessageStateReceived 是入站消息（收到即终态）。
+	//
+	// 落盘时折叠为 "已发送"：入站消息没有别的可能状态，
+	// 而方向由 Outgoing 单独记录。
+	MessageStateReceived MessageState = 3
+)
 
 // Event 是 core 向 UI 推送的事件。
 //
@@ -250,6 +279,16 @@ type Config struct {
 	// 反过来会出现"界面显示已添加、重启后消失"，
 	// 那种不一致比直接报错更难查。
 	Persist PersistFunc
+
+	// Store 是消息持久化层（可选）。
+	//
+	// 为 nil 时不持久化——测试与只读场景用。
+	//
+	// 注意它**不是**"是否加密"的开关：storage 层在没有主密钥时
+	// 直接返回 ErrNoKey 拒绝写入，不会退化成明文落盘。
+	// 因此"明文身份 + 传了 Store" 的结果是**没有历史**，
+	// 而不是**明文历史**。
+	Store storage.Store
 
 	// Logf 是底层组件的日志出口（可选）。
 	Logf func(string, ...any)
@@ -383,6 +422,20 @@ func New(cfg Config) (*App, error) {
 		id := fp.String()
 		a.contacts[id] = &contactState{cfg: c, fp: fp, status: StatusOffline}
 		a.order = append(a.order, id)
+	}
+
+	// 载入历史消息。放在联系人装载之后：只有仍在联系人表里的
+	// 会话才恢复历史（见 restoreHistory）。
+	if cfg.Store != nil {
+		recs, err := cfg.Store.Load()
+		if err != nil {
+			// 读不出历史不阻止启动：网络功能仍然可用，
+			// 而没有历史总比打不开程序好。但必须留痕。
+			cfg.Logf("core: loading message history failed: %v", err)
+		} else {
+			a.restoreHistory(recs)
+			cfg.Logf("core: restored %d message(s) from disk", len(recs))
+		}
 	}
 
 	a.mgr = session.New(session.Config{

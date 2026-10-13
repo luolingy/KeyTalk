@@ -50,10 +50,9 @@ func runGUI(ctx context.Context, opt options, logf func(string, ...any)) error {
 	setup, err := core.NewSetup(core.SetupConfig{
 		DataDir: opt.dataDir,
 		Logf:    logf,
-		BuildApp: func(identity crypto.IdentityProvider,
-			contacts []core.ContactConfig, persist core.PersistFunc) (*core.App, error) {
+		BuildApp: func(sess core.SetupSession) (*core.App, error) {
 
-			fp := identity.Fingerprint()
+			fp := sess.Identity.Fingerprint()
 
 			gtr := lan.New(lan.Config{
 				Fingerprint:     fp.String(),
@@ -83,18 +82,19 @@ func runGUI(ctx context.Context, opt options, logf func(string, ...any)) error {
 			// 联系人要么来自本地 contacts.json（即用户此前导入公钥时
 			// 确认过），要么来自界面里勾选了"已核对指纹"的添加动作。
 			// 两条路都经过用户确认，因此这里全部视为已核对。
-			fps := make([]string, 0, len(contacts))
-			for _, c := range contacts {
+			fps := make([]string, 0, len(sess.Contacts))
+			for _, c := range sess.Contacts {
 				fps = append(fps, c.Fingerprint)
 			}
 
 			app, err := core.New(core.Config{
-				Identity:            identity,
+				Identity:            sess.Identity,
 				Importer:            &crypto.PGPImporter{},
 				Transport:           gtr,
-				Contacts:            contacts,
+				Contacts:            sess.Contacts,
 				TrustedFingerprints: fps,
-				Persist:             persist,
+				Persist:             sess.Persist,
+				Store:               sess.Store,
 				Logf:                logf,
 			})
 			if err != nil {

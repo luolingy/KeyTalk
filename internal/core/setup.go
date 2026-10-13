@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/storage"
 )
 
 // Setup 是"App 之前"的那一段生命周期：生成身份、导入身份、解锁。
@@ -40,6 +41,27 @@ type Setup struct {
 	name     string
 	contacts []ContactConfig
 	app      *App
+
+	// msgStore 是消息持久化层。
+	//
+	// 明文身份（v1）没有主密钥，因此这里会是 nil——
+	// 那种情况下**不写**任何消息，而不是退化成明文落盘。
+	msgStore storage.Store
+}
+
+// SetupSession 是身份就绪后交给 BuildApp 的一切。
+//
+// 用一个结构体而不是越来越长的参数表：每加一项依赖
+// （持久化、附件目录……）都要改所有调用点，而结构体不会。
+type SetupSession struct {
+	// Identity 是本机身份，必填。
+	Identity crypto.IdentityProvider
+	// Contacts 是已导入的联系人。
+	Contacts []ContactConfig
+	// Persist 把联系人列表写回磁盘。
+	Persist PersistFunc
+	// Store 是消息持久化层。明文身份没有主密钥，因此可能为 nil。
+	Store storage.Store
 }
 
 // SetupStage 描述配置阶段的进度。
@@ -69,8 +91,7 @@ type SetupConfig struct {
 	// 做成回调而不是让 core 自己建传输层：core 只认
 	// transport.Transport 接口，不该知道 mDNS 与 TCP 端口
 	// （见 docs/architecture.md §1.1）。
-	BuildApp func(identity crypto.IdentityProvider, contacts []ContactConfig,
-		persist PersistFunc) (*App, error)
+	BuildApp func(SetupSession) (*App, error)
 
 	Logf func(string, ...any)
 }
@@ -148,8 +169,11 @@ func (s *Setup) Meta() *crypto.IdentityMeta {
 // DataDir 返回数据目录。
 func (s *Setup) DataDir() string { return s.cfg.DataDir }
 
-// Store 暴露底层身份存储，供界面读取公钥等只读信息。
-func (s *Setup) Store() *crypto.IdentityStore { return s.store }
+// IdentityStore 暴露底层身份存储，供界面读取公钥等只读信息。
+//
+// 名字里带 Identity 是为了和消息存储（msgStore）区分开：
+// 两个都叫 Store 的时候，"解锁的到底是哪一个"极易看错。
+func (s *Setup) IdentityStore() *crypto.IdentityStore { return s.store }
 
 // Contacts 返回已导入的联系人。
 func (s *Setup) Contacts() []ContactConfig {
@@ -193,15 +217,59 @@ func (s *Setup) CreateIdentity(name, passphrase string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prov, err := s.store.Create(name, passphrase)
+	if _, err := s.store.Create(name, passphrase); err != nil {
+		return err
+	}
+	// 立刻再解锁一次，只为了拿到 MK。
+	//
+	// Create 只交出 provider，而消息加密需要 MK；MK 是随机的、
+	// 不在口令里，除了解锁的那一刻推导不出来。代价是多跑一次
+	// argon2（几百毫秒），而这只在创建身份时发生一次。
+	// 给 Create/Import 各加一个 ...WithMK 变体也能避免它，
+	// 但会让这三个方法的签名各自分裂成两份。
+	prov, mk, err := s.store.UnlockWithMK(passphrase)
 	if err != nil {
 		return err
 	}
 	s.identity = prov
 	s.name = name
 	s.stage = StageReady
+	s.openMessageStore(mk)
+	crypto.Zero(mk)
 	s.cfg.Logf("setup: identity created for %q (%s)", name, prov.Fingerprint().Display())
 	return nil
+}
+
+// openMessageStore 用刚解出的 MK 打开消息存储。
+//
+// mk 为 nil（v1 明文身份）时明确不打开：没有密钥就无法加密落盘，
+// 而 storage 层拒绝明文降级。于是那种身份**没有**消息历史，
+// 界面上会说明原因，而不是悄悄写一份明文聊天记录。
+func (s *Setup) openMessageStore(mk []byte) {
+	if s.msgStore != nil {
+		_ = s.msgStore.Close()
+		s.msgStore = nil
+	}
+	if len(mk) == 0 {
+		s.cfg.Logf("setup: identity has no master key (plaintext identity); " +
+			"messages will NOT be persisted")
+		return
+	}
+	st, err := storage.Open(s.cfg.DataDir, mk)
+	if err != nil {
+		// 打不开就不持久化。网络功能不受影响。
+		s.cfg.Logf("setup: opening the message store failed, "+
+			"messages will NOT be persisted: %v", err)
+		return
+	}
+	s.msgStore = st
+}
+
+// HasMessageStore 报告本次运行是否会持久化消息。
+func (s *Setup) HasMessageStore() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.msgStore != nil
 }
 
 // minPassphraseLen 是最短口令长度。
@@ -218,12 +286,14 @@ func (s *Setup) Unlock(passphrase string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prov, err := s.store.Unlock(passphrase)
+	prov, mk, err := s.store.UnlockWithMK(passphrase)
 	if err != nil {
 		return err
 	}
 	s.identity = prov
 	s.stage = StageReady
+	s.openMessageStore(mk)
+	crypto.Zero(mk)
 	s.cfg.Logf("setup: identity unlocked (%s)", prov.Fingerprint().Display())
 	return nil
 }
@@ -243,11 +313,17 @@ func (s *Setup) ImportIdentity(armored, passphrase, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prov, err := s.store.Import(armored, passphrase, strings.TrimSpace(name))
+	if _, err := s.store.Import(armored, passphrase, strings.TrimSpace(name)); err != nil {
+		return err
+	}
+	// 同 CreateIdentity：再解锁一次只为拿 MK。
+	prov, mk, err := s.store.UnlockWithMK(passphrase)
 	if err != nil {
 		return err
 	}
 	s.identity = prov
+	s.openMessageStore(mk)
+	crypto.Zero(mk)
 	// 从密钥里回读显示名，避免用户手输错。
 	if n := prov.Name(); n != "" {
 		s.name = n
@@ -297,7 +373,12 @@ func (s *Setup) App() (*App, error) {
 		return nil, ErrSetupNotReady
 	}
 
-	app, err := s.cfg.BuildApp(s.identity, s.contacts, s.saveContactsLocked)
+	app, err := s.cfg.BuildApp(SetupSession{
+		Identity: s.identity,
+		Contacts: s.contacts,
+		Persist:  s.saveContactsLocked,
+		Store:    s.msgStore,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -370,6 +451,10 @@ func (s *Setup) ExportPublicKey() (string, error) {
 func (s *Setup) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.msgStore != nil {
+		_ = s.msgStore.Close()
+		s.msgStore = nil
+	}
 	if s.identity != nil {
 		s.identity.Close()
 		s.identity = nil

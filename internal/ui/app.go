@@ -765,6 +765,19 @@ func (a *uiState) bubbleCard(gtx layout.Context, m core.Message, level TrustLeve
 								lbl.Color = trustColor(level)
 								return lbl.Layout(gtx)
 							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								if m.State != core.MessageStateFailed {
+									return layout.Dimensions{}
+								}
+								// 发送失败必须**逐条**标出来。
+								//
+								// 重启之后这些消息看起来与已发送的
+								// 一模一样，不标就等于告诉用户
+								// "对方收到了"——而这正是事实的反面。
+								lbl := material.Caption(a.theme, "未发送（发送失败）")
+								lbl.Color = colorErr
+								return lbl.Layout(gtx)
+							}),
 						)
 					})
 				}),
