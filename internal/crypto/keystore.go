@@ -266,10 +266,38 @@ func purposeAAD(p LocalDataPurpose) []byte {
 	return []byte("keytalk/v1/local/" + string(p))
 }
 
+// bindingAAD 把用途与额外绑定信息合成 AAD。
+//
+// 用 0x00 分隔而不是直接拼接：否则 ("ab","c") 与 ("a","bc")
+// 会得到同一个 AAD，绑定就不再是单射，跨用途/跨会话的搬运
+// 又变得可能了。
+func bindingAAD(p LocalDataPurpose, binding []byte) []byte {
+	base := purposeAAD(p)
+	if len(binding) == 0 {
+		return base
+	}
+	out := make([]byte, 0, len(base)+1+len(binding))
+	out = append(out, base...)
+	out = append(out, 0x00)
+	out = append(out, binding...)
+	return out
+}
+
 // EncryptLocal 用 MK 加密本地数据。
 func EncryptLocal(mk []byte, purpose LocalDataPurpose, plaintext []byte) (nonce, ciphertext []byte, err error) {
+	return EncryptLocalBound(mk, purpose, nil, plaintext)
+}
+
+// EncryptLocalBound 与 EncryptLocal 相同，但把 binding 并入 AAD。
+//
+// 用途标签只能说明"这是什么类型的数据"，说不了"这是谁的数据"。
+// 消息正文加上 binding（会话指纹 + 方向 + 消息 ID）之后，
+// 把 A 会话的密文搬到 B 会话的文件里会**解密失败**，
+// 而不是安静地显示成 B 说过的话。磁盘可被翻看的场景下，
+// 这个区别就是"篡改能否被察觉"。
+func EncryptLocalBound(mk []byte, purpose LocalDataPurpose, binding, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	nonce = randomBytes(NonceLen)
-	ciphertext, err = Seal(mk, nonce, plaintext, purposeAAD(purpose))
+	ciphertext, err = Seal(mk, nonce, plaintext, bindingAAD(purpose, binding))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -278,11 +306,27 @@ func EncryptLocal(mk []byte, purpose LocalDataPurpose, plaintext []byte) (nonce,
 
 // DecryptLocal 用 MK 解密本地数据。
 func DecryptLocal(mk []byte, purpose LocalDataPurpose, nonce, ciphertext []byte) ([]byte, error) {
+	return DecryptLocalBound(mk, purpose, nil, nonce, ciphertext)
+}
+
+// DecryptLocalBound 是 EncryptLocalBound 的逆操作。
+//
+// binding 必须与加密时**逐字节相同**，否则返回错误。
+func DecryptLocalBound(mk []byte, purpose LocalDataPurpose, binding, nonce, ciphertext []byte) ([]byte, error) {
 	if len(nonce) != NonceLen {
 		return nil, fmt.Errorf("%w: nonce len %d", ErrMalformed, len(nonce))
 	}
-	return Open(mk, nonce, ciphertext, purposeAAD(purpose))
+	return Open(mk, nonce, ciphertext, bindingAAD(purpose, binding))
 }
+
+// Zero 覆写一段敏感内存。
+//
+// 导出它是因为 MK 现在要穿过包边界交给储存层：
+// 交出密钥的生命周期，就必须同时交出擦除它的手段。
+//
+// ⚠️ 这是尽力而为：Go 可能已经复制过这段内存（栈增长、GC 移动）。
+// 它能缩短密钥的暴露窗口，不能保证它从未被复制。
+func Zero(b []byte) { zero(b) }
 
 // --- 帧计数器的持久化编解码（用于 DB 存储 BLOB） ---
 

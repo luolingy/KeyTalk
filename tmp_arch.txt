@@ -1,0 +1,8 @@
+### 3.6 `storage/`
+
+SQLite + 附件密文文件。表结构见 §5。**消息正文与附件密钥以密文形式存储**（MK 加密，见 [crypto-protocol.md](crypto-protocol.md) §10.2），避免本地明文泄露即全泄露。
+
+附件正文以**传输时的密文**原样存盘（零额外开销，见 [attachments.md](attachments.md) §10.2）。
+
+---
+

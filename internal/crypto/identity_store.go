@@ -175,32 +175,68 @@ func (s *IdentityStore) CreateUnencrypted(name string) (*PGPProvider, error) {
 //
 // 对 v1 明文身份，passphrase 被忽略（无物可解）。
 func (s *IdentityStore) Unlock(passphrase string) (*PGPProvider, error) {
-	idf, err := s.read()
+	prov, mk, err := s.UnlockWithMK(passphrase)
 	if err != nil {
 		return nil, err
+	}
+	// 本函数的调用方拿不到 MK，也就无从擦除，因此在这里就地擦掉。
+	Zero(mk)
+	return prov, nil
+}
+
+// UnlockWithMK 与 Unlock 相同，但同时**交出主密钥 MK**。
+//
+// # 为什么必须在这里交出去
+//
+// 本地持久化（消息正文、附件）要用 MK 加密，而这些数据
+// 第一次被读写就是在解锁之后。MK 是随机的、不在口令里，
+// 除了解锁的那一刻，别处**推导不出来**——所以只能从这里交给调用方。
+//
+// # 所有权
+//
+// 返回的 MK 归调用方所有，调用方必须在用完后 Zero 掉它。
+// 失败路径上本函数已经擦除，不会泄漏半途产生的 MK。
+//
+// v1 明文身份没有 keystore，因此返回 (prov, nil, nil)：
+// 调用方拿到 nil 就必须自己决定"没有 MK 所以无法加密落盘"
+// 是否可接受，而不是当它是一把全零的密钥。
+func (s *IdentityStore) UnlockWithMK(passphrase string) (*PGPProvider, []byte, error) {
+	idf, err := s.read()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	switch {
 	case idf.Keystore != nil && idf.SealedKey != nil:
 		mk, err := idf.Keystore.Unlock([]byte(passphrase))
 		if err != nil {
-			return nil, err // ErrWrongPassphrase
+			return nil, nil, err // ErrWrongPassphrase
 		}
-		defer zero(mk)
 
 		plain, err := DecryptLocal(mk, PurposeIdentityKey, idf.SealedKey.Nonce, idf.SealedKey.Ciphertext)
 		if err != nil {
 			// MK 解出来了却打不开私钥，说明文件被改过。
-			return nil, fmt.Errorf("%w: sealed private key failed to open", ErrKeystoreFormat)
+			Zero(mk)
+			return nil, nil, fmt.Errorf("%w: sealed private key failed to open", ErrKeystoreFormat)
 		}
 		defer zero(plain)
-		return ImportPGPIdentity(string(plain))
+
+		prov, err := ImportPGPIdentity(string(plain))
+		if err != nil {
+			Zero(mk)
+			return nil, nil, err
+		}
+		return prov, mk, nil
 
 	case idf.PrivateKey != "":
-		return ImportPGPIdentity(idf.PrivateKey)
+		prov, err := ImportPGPIdentity(idf.PrivateKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prov, nil, nil
 
 	default:
-		return nil, fmt.Errorf("%w: no key material", ErrKeystoreFormat)
+		return nil, nil, fmt.Errorf("%w: no key material", ErrKeystoreFormat)
 	}
 }
 

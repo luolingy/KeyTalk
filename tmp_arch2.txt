@@ -1,0 +1,75 @@
+## 5. 数据模型
+
+```sql
+-- 本机身份
+CREATE TABLE identity (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),  -- 单行
+    fingerprint TEXT NOT NULL,        -- 全量指纹（hex）
+    armored_pub TEXT NOT NULL,        -- 导出的公钥
+    created_at  INTEGER NOT NULL
+);
+
+-- 联系人
+CREATE TABLE contacts (
+    fingerprint   TEXT PRIMARY KEY,
+    display_name  TEXT NOT NULL,
+    armored_pub   TEXT NOT NULL,
+    trust         INTEGER NOT NULL DEFAULT 0,  -- 0=TOFU未验证 1=已带外验证 2=已拉黑
+    last_seen_at  INTEGER,
+    created_at    INTEGER NOT NULL
+);
+
+-- 会话（当前活跃的密钥上下文）
+CREATE TABLE sessions (
+    id            BLOB PRIMARY KEY,   -- 8 字节 session_id
+    peer_fp       TEXT NOT NULL REFERENCES contacts(fingerprint),
+    created_at    INTEGER NOT NULL,
+    rekey_count   INTEGER NOT NULL DEFAULT 0,
+    msg_count     INTEGER NOT NULL DEFAULT 0,
+    closed_at     INTEGER,
+    -- 注意：会话密钥不落库，见 crypto-protocol.md §10
+    FOREIGN KEY (peer_fp) REFERENCES contacts(fingerprint)
+);
+
+-- 消息（正文密文存储）
+CREATE TABLE messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_fp     TEXT NOT NULL,
+    direction   INTEGER NOT NULL,      -- 0=in 1=out
+    body_ct     BLOB NOT NULL,         -- 静态加密后的正文
+    body_nonce  BLOB NOT NULL,         -- 12 字节
+    sent_at     INTEGER NOT NULL,
+    state       INTEGER NOT NULL,      -- 0=pending 1=ack 2=failed
+    seq         INTEGER                -- 会话内序号（可空）
+);
+CREATE INDEX idx_messages_peer ON messages(peer_fp, sent_at);
+
+-- 附件（二期）；正文以密文文件存盘，见 attachments.md §10
+CREATE TABLE attachments (
+    file_id        BLOB PRIMARY KEY,    -- 16B
+    message_id     INTEGER REFERENCES messages(id),
+    peer_fp        TEXT NOT NULL REFERENCES contacts(fingerprint),
+    direction      INTEGER NOT NULL,    -- 0=in 1=out
+    name_ct        BLOB NOT NULL,       -- 文件名，MK 加密
+    name_nonce     BLOB NOT NULL,
+    mime_ct        BLOB,
+    size           INTEGER NOT NULL,
+    chunk_size     INTEGER NOT NULL,
+    total_chunks   INTEGER NOT NULL,
+    file_hash      BLOB NOT NULL,
+    file_key_ct    BLOB NOT NULL,       -- file_key，MK 加密
+    file_key_nonce BLOB NOT NULL,
+    state          INTEGER NOT NULL,    -- 0=offering 1=transferring 2=complete 3=failed 4=cancelled
+    received       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_attachments_msg ON attachments(message_id);
+```
+
+### 5.1 存储加密的诚实说明
+
+`messages.body_ct`、附件文件名与 `file_key` 使用**主密钥 MK** 加密（MK 由口令经 KEK 封装，见 [crypto-protocol.md](crypto-protocol.md) §10.2；与传输会话密钥无关）。目的是防止"设备被翻看数据库文件"这一场景，**不是**防止本机上的恶意进程——恶意进程可以读内存和口令。见 [threat-model.md](threat-model.md)。
+
+附件正文存盘的是**传输时的密文**（用 `file_key` 加密），因此不做二次加密；只要 `file_key` 仍被 MK 保护，附件就是安全的。详见 [attachments.md](attachments.md) §10.2。
+
+---
+
