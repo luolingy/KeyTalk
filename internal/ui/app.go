@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/layout"
@@ -112,6 +113,16 @@ type uiState struct {
 
 	// 收到新消息时把列表滚到底部。
 	scrollToEnd bool
+
+	// msgAnim 是"最新一条消息"的入场动画。
+	//
+	// 只用**一个**动画实例而不是每条消息各一个：入场动画只对
+	// "刚刚出现的那条"有意义，历史消息不需要动画。为每条消息
+	// 各存一个 time.Time 既浪费又会让滚动时旧消息莫名闪烁。
+	msgAnim animState
+
+	// bannerAnim 是顶部横幅的淡入动画。
+	bannerAnim animState
 
 	// sendBtn 是发送按钮的点击状态。
 	//
@@ -279,6 +290,10 @@ func (a *uiState) handleEvent(ev core.Event) {
 			a.selected = e.Message.PeerID
 		}
 		a.scrollToEnd = true
+		a.msgAnim.trigger(e.Message.ID, time.Now())
+		if a.win != nil {
+			a.win.Invalidate()
+		}
 
 	case core.MessageSent:
 		a.scrollToEnd = true
@@ -668,9 +683,33 @@ func (a *uiState) messageList(gtx layout.Context) layout.Dimensions {
 		})
 	}
 
+	// 让"最新一条"入场：当列表最后一条的 ID 变了就重启动画。
+	//
+	// 放在这里而不是 handleEvent：本地发出的消息由 App 在后台生成 ID，
+	// UI 在发送当下拿不到，只有下一帧从 Messages() 读出来才知道是哪条。
+	// 以"列表尾部 ID 变化"为准，收发两种情形就统一了。
+	last := msgs[len(msgs)-1]
+	a.msgAnim.trigger(last.ID, gtx.Now)
+
+	// 进度：只有最新一条在用动画，更早的消息恒为 1（完全显现）。
+	now := gtx.Now
+	var anim float32 = 1
+	var animating bool
+	if len(msgs) > 0 {
+		anim, animating = a.msgAnim.progress(now)
+		if animating {
+			a.win.Invalidate()
+		}
+	}
+
 	return material.List(a.theme, &a.msgList).Layout(gtx, len(msgs),
 		func(gtx layout.Context, i int) layout.Dimensions {
-			return a.bubble(gtx, msgs[i])
+			// 只让最后一条参与入场动画。
+			p := float32(1)
+			if i == len(msgs)-1 {
+				p = anim
+			}
+			return a.bubble(gtx, msgs[i], p)
 		})
 }
 
@@ -681,8 +720,16 @@ func (a *uiState) messageList(gtx layout.Context) layout.Dimensions {
 // 理由：把信任状态只放在顶部会被忽略——用户读消息时不看顶部。
 // 把一条 3px 的色带贴在气泡边缘，用户在阅读内容时无法避开它。
 // 这比任何弹出提示都更有效，因为它不打断操作，也就不会被关掉。
-func (a *uiState) bubble(gtx layout.Context, m core.Message) layout.Dimensions {
+func (a *uiState) bubble(gtx layout.Context, m core.Message, progress float32) layout.Dimensions {
 	level := a.trustFor(m.PeerID)
+
+	// 入场动画：从下方 8dp 处升上来，同时淡入。
+	//
+	// 只改透明度与位移，不改尺寸——尺寸变化会触发布局抖动，
+	// 让整个列表在动画期间"跳"一下，比没有动画更糟。
+	eased := easeOutCubic(progress)
+	riseDp := int((1 - eased) * 8)
+	alpha := uint8(0xFF * eased)
 
 	inset := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(16), Right: unit.Dp(16)}
 	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -691,16 +738,41 @@ func (a *uiState) bubble(gtx layout.Context, m core.Message) layout.Dimensions {
 			align = layout.End
 		}
 
+		// 升入：用一个 Offscreen 把内容整体做透明度，用偏移做位移。
+		//
+		// 位移通过 op.Offset 实现（向下 8dp 起步）。Gio 里位移与
+		// 透明度都作用在 op 栈上，不影响布局占位——所以列表不会抖。
+		off := op.Offset(image.Pt(0, gtx.Dp(unit.Dp(riseDp)))).Push(gtx.Ops)
+		defer off.Pop()
+
 		return layout.Flex{Axis: layout.Vertical, Alignment: align}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				maxW := gtx.Dp(unit.Dp(maxBubbleWidthDp))
 				if gtx.Constraints.Max.X > maxW {
 					gtx.Constraints.Max.X = maxW
 				}
-				return a.bubbleCard(gtx, m, level)
+				// alpha==0xFF 时不做 Offscreen，省一次离屏渲染。
+				if alpha == 0xFF {
+					return a.bubbleCard(gtx, m, level)
+				}
+				return a.fadeIn(gtx, alpha, func(gtx layout.Context) layout.Dimensions {
+					return a.bubbleCard(gtx, m, level)
+				})
 			}),
 		)
 	})
+}
+
+// fadeIn 用绘制期透明度包装一层内容。
+//
+// Gio 没有"直接设置全局 alpha"的 draw 原语，惯用做法是把内容录进
+// 离屏层，再用 paint.PushOpacity 重新画出来。这里 package 内封装，
+// 免得每次调用都重复这段 op 栈操作。
+func (a *uiState) fadeIn(gtx layout.Context, alpha uint8, content layout.Widget) layout.Dimensions {
+	stack := paint.PushOpacity(gtx.Ops, float32(alpha)/255)
+	dims := content(gtx)
+	stack.Pop()
+	return dims
 }
 
 // trustFor 返回某个会话当前的信任等级（未知会话按"未知"处理）。
@@ -925,7 +997,8 @@ func (a *uiState) statusBar(gtx layout.Context) layout.Dimensions {
 
 		text := a.fontMsg
 		col := colorFaint
-		if a.banner != "" {
+		isBanner := a.banner != ""
+		if isBanner {
 			text = a.banner
 			if a.bannerErr {
 				col = colorErr
@@ -934,11 +1007,30 @@ func (a *uiState) statusBar(gtx layout.Context) layout.Dimensions {
 			}
 		}
 
+		// 横幅出现时淡入，而不是"啪"地跳出来。
+		// 只在横幅内容变化时重启动画；常驻的字体提示不做动画。
+		var alpha uint8 = 0xFF
+		if isBanner {
+			a.bannerAnim.trigger(text, gtx.Now)
+			p, active := a.bannerAnim.progress(gtx.Now)
+			if active {
+				a.win.Invalidate()
+			}
+			alpha = uint8(0xFF * easeOutCubic(p))
+		}
+
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				lbl := material.Caption(a.theme, text)
-				lbl.Color = col
-				return lbl.Layout(gtx)
+				if alpha == 0xFF {
+					lbl := material.Caption(a.theme, text)
+					lbl.Color = col
+					return lbl.Layout(gtx)
+				}
+				return a.fadeIn(gtx, alpha, func(gtx layout.Context) layout.Dimensions {
+					lbl := material.Caption(a.theme, text)
+					lbl.Color = col
+					return lbl.Layout(gtx)
+				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				// 持续提示"检查对方身份"这一动作的存在。
