@@ -180,7 +180,7 @@ func (a *uiState) verifyButton(gtx layout.Context, c core.Contact) layout.Dimens
 			func(gtx layout.Context) layout.Dimensions {
 				m := op.Record(gtx.Ops)
 				dims := a.verifyButtonContent(gtx, fg)
-				op.Defer(gtx.Ops, m.Stop())
+				m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 				fillRounded(gtx, colorTrustVerified, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 				return dims
 			},

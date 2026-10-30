@@ -103,7 +103,7 @@ func (a *uiState) overlay(gtx layout.Context) {
 			func(gtx layout.Context) layout.Dimensions {
 				m := op.Record(gtx.Ops)
 				dims := a.panelContent(gtx)
-				op.Defer(gtx.Ops, m.Stop())
+				m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 				fillRounded(gtx, colorSurface, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 				return dims
 			},
@@ -238,7 +238,7 @@ func (a *uiState) fingerprintConfirm(gtx layout.Context) layout.Dimensions {
 							}),
 						)
 					})
-					op.Defer(gtx.Ops, m.Stop())
+					m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 					fillRounded(gtx, colorRaised, dims.Size, gtx.Dp(unit.Dp(radiusSmall)))
 					return dims
 				},
@@ -690,7 +690,7 @@ func (a *uiState) boxedEditor(gtx layout.Context, ed *widget.Editor, hint string
 		func(gtx layout.Context) layout.Dimensions {
 			m := op.Record(gtx.Ops)
 			dims := inset.Layout(gtx, content)
-			op.Defer(gtx.Ops, m.Stop())
+			m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 			fillRounded(gtx, colorRaised, dims.Size, gtx.Dp(unit.Dp(radiusSmall)))
 			return dims
 		},

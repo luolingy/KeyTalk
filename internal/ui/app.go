@@ -815,7 +815,7 @@ func (a *uiState) composerArea(gtx layout.Context) layout.Dimensions {
 					func(gtx layout.Context) layout.Dimensions {
 						m := op.Record(gtx.Ops)
 						dims := a.editorContent(gtx)
-						op.Defer(gtx.Ops, m.Stop())
+						m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 						fillRounded(gtx, colorRaised, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 						return dims
 					},
@@ -895,7 +895,7 @@ func (a *uiState) sendButton(gtx layout.Context) layout.Dimensions {
 					lbl.Color = btnFg
 					return lbl.Layout(gtx)
 				})
-				op.Defer(gtx.Ops, m.Stop())
+				m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 				fillRounded(gtx, bc, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 				return dims
 			},

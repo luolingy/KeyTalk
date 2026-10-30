@@ -102,7 +102,7 @@ func (a *uiState) onboardingWhy(gtx layout.Context) layout.Dimensions {
 		func(gtx layout.Context) layout.Dimensions {
 			m := op.Record(gtx.Ops)
 			dims := a.onboardingWhyContent(gtx)
-			op.Defer(gtx.Ops, m.Stop())
+			m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 			fillRounded(gtx, colorRaised, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 			return dims
 		},

@@ -118,7 +118,7 @@ func (a *uiState) setupCard(gtx layout.Context) layout.Dimensions {
 		func(gtx layout.Context) layout.Dimensions {
 			m := op.Record(gtx.Ops)
 			dims := a.setupCardContent(gtx)
-			op.Defer(gtx.Ops, m.Stop())
+			m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 			fillRounded(gtx, colorSurface, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 			return dims
 		},
@@ -430,7 +430,7 @@ func field(gtx layout.Context, th *material.Theme, ed *widget.Editor, label, hin
 						e.HintColor = colorFaint
 						return e.Layout(gtx)
 					})
-					op.Defer(gtx.Ops, m.Stop())
+					m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 					fillRounded(gtx, colorRaised, dims.Size, gtx.Dp(unit.Dp(radiusSmall)))
 					return dims
 				},
@@ -473,7 +473,7 @@ func (a *uiState) button(gtx layout.Context, click *widget.Clickable, bg, fg col
 			func(gtx layout.Context) layout.Dimensions {
 				m := op.Record(gtx.Ops)
 				dims := inset.Layout(gtx, content)
-				op.Defer(gtx.Ops, m.Stop())
+				m.Stop() // 仅用于测量尺寸；不要 Defer——那会重放内容
 				fillRounded(gtx, bg, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
 				return dims
 			},
