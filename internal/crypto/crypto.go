@@ -144,6 +144,15 @@ func randomBytes(n int) []byte {
 	return b
 }
 
+// RandomBytes32 返回 32 字节密码学安全随机数（群组密钥等对称密钥用）。
+//
+// 导出它是为了让上层（如 group 包）无需自行挑选随机源——随机数用错
+// 源是密码学实现里最常见的灾难，把"正确的那一个"暴露出去更安全。
+func RandomBytes32() []byte { return randomBytes(32) }
+
+// RandomNonce 返回一个 NonceLen 字节的随机 nonce。
+func RandomNonce() []byte { return randomBytes(NonceLen) }
+
 // zero 尽力清除敏感缓冲。
 //
 // 注意（见 docs/crypto-protocol.md §10.5）：Go 无法保证内存清零——
