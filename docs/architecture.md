@@ -175,17 +175,23 @@ func (a *App) Events() <-chan UIEvent
 
 ### 3.6 `storage/`
 
-**追加式加密日志**。每个会话一个文件：
+**自研的嵌入式加密数据库**（`internal/db`），单文件 `<dataDir>/chat.db`。
 
-```
-<dataDir>/messages/<对端指纹>.jsonl
-```
+这一节曾经写的是 SQLite + 附件密文文件，也曾经退而用追加式 JSONL 日志。现在两者都不是：构建环境取不到纯 Go 的 SQLite 驱动（模块缓存没有、代理不可达），而"聊天记录放在一个可检索的加密数据库里"是核心需求，于是实现了一个只解决本场景问题的迷你引擎。
 
-每行一个 JSON 对象，正文用 MK 加密（见 [crypto-protocol.md](crypto-protocol.md) §10.2），AAD 里绑定对端指纹、消息 ID 与状态。目的是避免"本地明文泄露即全泄露"——攻击者翻到磁盘文件也读不出口令保护的内容。
+- **页式**：每页 4 KiB，**每页独立加密**（`PurposePage`），AAD 绑定"文件盐 ‖ 页号"。因此页被搬到别的偏移、搬到别的库、或被改一个字节，都会**解密失败**而不是安静地返回错误内容。整个文件只有 64 字节明文头（magic、版本、页大小、盐、密钥校验值 KCV）。
+- **表与索引**：`messages` / `contacts` / `attachments` 三张表，各有页链；`messages` 有按 ID 的索引页链，使"按 ID 覆盖"是 O(1)。
+- **事务**：写入先进脏页集，`Commit` 依次写数据页 → 元数据页 → fsync；`Rollback` 丢弃并**还原元数据快照**（不还原的话 NextPage 会指向没写过的页，下次打开直接报"页被截断"）。
+- **打开即全校验**：`Open` 检查文件长度并逐页 AEAD 验签，坏库在门口就被拦住，而不是聊到一半才炸。
+- **口令**：口令 → argon2id → KEK → 解包 MK。MK 同时用于数据库与附件；口令错由 KCV 在第一毫秒判定为 `ErrWrongKey`。
 
-**没有主密钥就不落盘**：明文身份（v1）没有 keystore，因此没有 MK，此时 `storage.Open` 直接返回 `ErrNoKey`，结果是**没有历史**，而不是**明文历史**。不存在静默降级到明文的路径。
+**没有主密钥就不落盘**：明文身份（v1）没有 keystore，因此没有 MK，`OpenDBStore` 返回 nil，结果是**没有历史**而不是**明文历史**，不存在静默降级路径。
 
-> 附件正文将来以**传输时的密文**原样存盘（零额外开销，见 [attachments.md](attachments.md) §10.2），尚未实现。
+**附件**由 `internal/files` 按 64 KiB 分块加密（`PurposeAttachmentBlob`，AAD 绑定 blobID ‖ 块号），落盘 `<dataDir>/blobs/<blobID>.bin`。分块使内存占用与附件大小无关；块号绑定使块不能互换、截断会被发现；读取时校验明文 SHA-256。
+
+**旧数据迁移**：首次以新库启动时，若存在旧版 `<dataDir>/messages/*.jsonl`，会被一次性导入，原目录改名 `messages.migrated/` **保留**（可回退）。迁移复用 `internal/storage` 的读取实现，不重写解密逻辑。
+
+**备份**：`internal/backup` 导出单个 `.ktbackup` 文件，内容是 `identity.json` 原始字节 + 通讯录，用**导出专用口令**（建议异于登录口令）加密。恢复时仍需要登录口令解锁——备份携带的是身份文件，不是解密它的能力。
 
 #### 与 SQLite 方案的偏离（诚实记录）
 
@@ -275,8 +281,7 @@ keytalk/
 
 ## 5. 数据模型
 
-> ⚠️ **本节是目标模型，尚未实现。** 当前的消息持久化用的是
-> §3.6 描述的追加式加密日志，不是这里的 SQLite 表。
+> ⚠️ **本节是 SQLite 目标模型，当前实现不是 SQLite。** 消息持久化用 §3.6 的自研加密数据库；
 > 下面的 `messages` 表结构仍然是理解字段意图的参考：
 > 日志里的 `id` / `out` / `st` / `sent_at` 与它一一对应。
 > `identity` / `contacts` 两张表同样没有实现——那两项现在
