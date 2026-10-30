@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/db"
 	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
-	"github.com/exeliang/keytalk/internal/storage"
 	"github.com/exeliang/keytalk/internal/transport"
 )
 
@@ -611,15 +611,15 @@ func (a *App) persist(msg Message) {
 	if a.cfg.Store == nil {
 		return
 	}
-	rec := storage.MessageRecord{
+	rec := db.Message{
 		ID:       msg.ID,
 		PeerFP:   msg.PeerID,
 		Outgoing: msg.Outgoing,
 		Text:     msg.Text,
-		SentAt:   msg.SentAt,
+		SentAtMS: msg.SentAt.UnixMilli(),
 		State:    storeStateOf(msg.State),
 	}
-	if err := a.cfg.Store.Append(rec); err != nil {
+	if err := a.cfg.Store.AppendMessage(rec); err != nil {
 		a.cfg.Logf("core: persisting message %s failed: %v", msg.ID, err)
 	}
 }
@@ -628,17 +628,18 @@ func (a *App) persist(msg Message) {
 func storeStateOf(s MessageState) int {
 	switch s {
 	case MessageStatePending:
-		return storage.StatePending
+		return db.StatePending
 	case MessageStateFailed:
-		return storage.StateFailed
+		return db.StateFailed
+	case MessageStateReceived:
+		return db.StateReceived
 	default:
-		// Sent 与 Received 都落到"已送达"。
-		return storage.StateSent
+		return db.StateSent
 	}
 }
 
 // restoreHistory 把磁盘上的历史装回内存。
-func (a *App) restoreHistory(recs []storage.MessageRecord) {
+func (a *App) restoreHistory(recs []db.Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -651,13 +652,15 @@ func (a *App) restoreHistory(recs []storage.MessageRecord) {
 
 		state := MessageStateSent
 		switch r.State {
-		case storage.StateFailed:
+		case db.StateFailed:
 			state = MessageStateFailed
-		case storage.StatePending:
+		case db.StatePending:
 			// 上次进程在这条消息发出去之前就结束了。本版本没有
 			// 重发机制，因此按"失败"恢复——**不**假装它已经发出。
 			// 显示成已发送会让用户以为对方看到了。
 			state = MessageStateFailed
+		case db.StateReceived:
+			state = MessageStateReceived
 		}
 		if !r.Outgoing {
 			state = MessageStateReceived
@@ -668,7 +671,7 @@ func (a *App) restoreHistory(recs []storage.MessageRecord) {
 			PeerID:   r.PeerFP,
 			Outgoing: r.Outgoing,
 			Text:     r.Text,
-			SentAt:   r.SentAt,
+			SentAt:   time.UnixMilli(r.SentAtMS),
 			Pending:  false,
 			State:    state,
 		})

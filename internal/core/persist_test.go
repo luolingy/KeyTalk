@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/exeliang/keytalk/internal/storage"
+	"github.com/exeliang/keytalk/internal/db"
 )
 
 // TestSetupRestoresHistoryFromDisk 验证"重启后消息还在"这条完整路径：
@@ -30,13 +30,13 @@ func TestSetupRestoresHistoryFromDisk(t *testing.T) {
 
 	// 直接往存储层写一条，模拟上一次运行留下的记录。
 	// 用的是 Setup 自己打开的那一份，因此密钥一定对得上。
-	if err := s.msgStore.Append(storage.MessageRecord{
+	if err := s.msgStore.AppendMessage(db.Message{
 		ID:       "m-from-last-run",
 		PeerFP:   peerFP,
 		Outgoing: false,
 		Text:     "上一次运行时说的话",
-		SentAt:   time.Now().Add(-time.Hour),
-		State:    storage.StateSent,
+		SentAtMS: time.Now().Add(-time.Hour).UnixMilli(),
+		State:    db.StateSent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -91,10 +91,10 @@ func TestRestorePendingBecomesFailed(t *testing.T) {
 		contacts: map[string]*contactState{peerAConst: {}},
 		messages: map[string][]Message{},
 	}
-	a.restoreHistory([]storage.MessageRecord{
-		{ID: "m1", PeerFP: peerAConst, Outgoing: true, Text: "没发出去的", State: storage.StatePending},
-		{ID: "m2", PeerFP: peerAConst, Outgoing: true, Text: "发失败的", State: storage.StateFailed},
-		{ID: "m3", PeerFP: peerAConst, Outgoing: true, Text: "发出去的", State: storage.StateSent},
+	a.restoreHistory([]db.Message{
+		{ID: "m1", PeerFP: peerAConst, Outgoing: true, Text: "没发出去的", State: db.StatePending},
+		{ID: "m2", PeerFP: peerAConst, Outgoing: true, Text: "发失败的", State: db.StateFailed},
+		{ID: "m3", PeerFP: peerAConst, Outgoing: true, Text: "发出去的", State: db.StateSent},
 	})
 
 	byID := map[string]Message{}
@@ -132,8 +132,8 @@ func TestRestoreDropsUnknownPeers(t *testing.T) {
 		contacts: map[string]*contactState{},
 		messages: map[string][]Message{},
 	}
-	a.restoreHistory([]storage.MessageRecord{
-		{ID: "m1", PeerFP: peerAConst, Outgoing: true, Text: "不该出现", State: storage.StateSent},
+	a.restoreHistory([]db.Message{
+		{ID: "m1", PeerFP: peerAConst, Outgoing: true, Text: "不该出现", State: db.StateSent},
 	})
 	if n := len(a.messages[peerAConst]); n != 0 {
 		t.Fatalf("restored %d messages for a peer that is not a contact", n)
@@ -146,11 +146,12 @@ func TestStoreStateMapping(t *testing.T) {
 		in   MessageState
 		want int
 	}{
-		{MessageStatePending, storage.StatePending},
-		{MessageStateSent, storage.StateSent},
-		{MessageStateFailed, storage.StateFailed},
-		// 入站消息折叠为"已送达"，方向由 Outgoing 单独记录。
-		{MessageStateReceived, storage.StateSent},
+		{MessageStatePending, db.StatePending},
+		{MessageStateSent, db.StateSent},
+		{MessageStateFailed, db.StateFailed},
+		// 新库有独立的"已收到"状态，不再折叠为"已送达"。
+		// 这让"重启后恢复"能准确区分入站与出站。
+		{MessageStateReceived, db.StateReceived},
 	}
 	for _, c := range cases {
 		if got := storeStateOf(c.in); got != c.want {

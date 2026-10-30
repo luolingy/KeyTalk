@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/exeliang/keytalk/internal/crypto"
-	"github.com/exeliang/keytalk/internal/storage"
 )
 
 // Setup 是"App 之前"的那一段生命周期：生成身份、导入身份、解锁。
@@ -46,7 +45,7 @@ type Setup struct {
 	//
 	// 明文身份（v1）没有主密钥，因此这里会是 nil——
 	// 那种情况下**不写**任何消息，而不是退化成明文落盘。
-	msgStore storage.Store
+	msgStore MessageStore
 }
 
 // SetupSession 是身份就绪后交给 BuildApp 的一切。
@@ -61,7 +60,7 @@ type SetupSession struct {
 	// Persist 把联系人列表写回磁盘。
 	Persist PersistFunc
 	// Store 是消息持久化层。明文身份没有主密钥，因此可能为 nil。
-	Store storage.Store
+	Store MessageStore
 }
 
 // SetupStage 描述配置阶段的进度。
@@ -240,10 +239,10 @@ func (s *Setup) CreateIdentity(name, passphrase string) error {
 	return nil
 }
 
-// openMessageStore 用刚解出的 MK 打开消息存储。
+// openMessageStore 用刚解出的 MK 打开加密数据库。
 //
 // mk 为 nil（v1 明文身份）时明确不打开：没有密钥就无法加密落盘，
-// 而 storage 层拒绝明文降级。于是那种身份**没有**消息历史，
+// 而库层拒绝明文降级。于是那种身份**没有**消息历史，
 // 界面上会说明原因，而不是悄悄写一份明文聊天记录。
 func (s *Setup) openMessageStore(mk []byte) {
 	if s.msgStore != nil {
@@ -255,14 +254,25 @@ func (s *Setup) openMessageStore(mk []byte) {
 			"messages will NOT be persisted")
 		return
 	}
-	st, err := storage.Open(s.cfg.DataDir, mk)
+	st, err := OpenDBStore(s.cfg.DataDir, mk)
 	if err != nil {
 		// 打不开就不持久化。网络功能不受影响。
-		s.cfg.Logf("setup: opening the message store failed, "+
+		// 注意 ErrWrongKey 也走这条路径：如果派生出的 MK 打不开库，
+		// 说明身份与库不是一对，此时**绝不能**新建库覆盖它。
+		s.cfg.Logf("setup: opening the message database failed, "+
 			"messages will NOT be persisted: %v", err)
 		return
 	}
+	if st == nil {
+		return
+	}
 	s.msgStore = st
+
+	// 一次性迁移旧版 jsonl 日志。失败不阻断启动：
+	// 迁移是尽力而为，旧文件会保留。
+	if err := migrateLegacyLog(s.cfg.DataDir, mk, st, s.cfg.Logf); err != nil {
+		s.cfg.Logf("setup: legacy log migration failed: %v", err)
+	}
 }
 
 // HasMessageStore 报告本次运行是否会持久化消息。

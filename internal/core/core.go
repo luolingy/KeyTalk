@@ -36,7 +36,6 @@ import (
 	"github.com/exeliang/keytalk/internal/crypto"
 	"github.com/exeliang/keytalk/internal/sas"
 	"github.com/exeliang/keytalk/internal/session"
-	"github.com/exeliang/keytalk/internal/storage"
 	"github.com/exeliang/keytalk/internal/transport"
 )
 
@@ -284,11 +283,11 @@ type Config struct {
 	//
 	// 为 nil 时不持久化——测试与只读场景用。
 	//
-	// 注意它**不是**"是否加密"的开关：storage 层在没有主密钥时
-	// 直接返回 ErrNoKey 拒绝写入，不会退化成明文落盘。
-	// 因此"明文身份 + 传了 Store" 的结果是**没有历史**，
+	// 注意它**不是**"是否加密"的开关：库层在没有主密钥时根本
+	// 不会被打开（OpenDBStore 返回 nil），不会退化成明文落盘。
+	// 因此"明文身份 + 没有 Store" 的结果是**没有历史**，
 	// 而不是**明文历史**。
-	Store storage.Store
+	Store MessageStore
 
 	// Logf 是底层组件的日志出口（可选）。
 	Logf func(string, ...any)
@@ -427,7 +426,7 @@ func New(cfg Config) (*App, error) {
 	// 载入历史消息。放在联系人装载之后：只有仍在联系人表里的
 	// 会话才恢复历史（见 restoreHistory）。
 	if cfg.Store != nil {
-		recs, err := cfg.Store.Load()
+		recs, err := cfg.Store.LoadMessages()
 		if err != nil {
 			// 读不出历史不阻止启动：网络功能仍然可用，
 			// 而没有历史总比打不开程序好。但必须留痕。
