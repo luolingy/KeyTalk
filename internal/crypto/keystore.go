@@ -260,6 +260,25 @@ const (
 	// 单独的用途标签让私钥密文无法被搬到消息正文或附件的位置使用：
 	// AAD 不同，解密必然失败（跨用途混淆防护）。
 	PurposeIdentityKey LocalDataPurpose = "identity-private-key"
+
+	// PurposePage 是聊天数据库的一个加密页。
+	//
+	// 整个库文件（除固定文件头）都是这种密文页，因此翻磁盘
+	// 看不到任何明文。页号绑进 AAD，页被搬到别的偏移会解密失败
+	// （防页交换攻击，见 internal/db 的说明）。
+	PurposePage LocalDataPurpose = "db-page"
+
+	// PurposeAttachmentBlob 是附件正文的一个加密块。
+	//
+	// 附件按块加密，绑定 blobID 与块号：块与块之间不能互换，
+	// 一个会话的附件块也不能被搬到另一个附件下面。
+	PurposeAttachmentBlob LocalDataPurpose = "attachment-blob"
+
+	// PurposeBackup 是整个导出备份包。
+	//
+	// 备份用**导出口令**派生的独立 KEK 加密，不是主密钥 MK：
+	// 备份要能交给别人保管，那把钥匙不该等于本机的解密能力。
+	PurposeBackup LocalDataPurpose = "backup-package"
 )
 
 func purposeAAD(p LocalDataPurpose) []byte {
