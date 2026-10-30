@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/exeliang/keytalk/internal/backup"
 
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -49,8 +52,15 @@ type infoState struct {
 	toggleBackupBtn widget.Clickable
 	exportBtn       widget.Clickable
 
+	// .ktbackup 文件导出/导入。
+	backupPathEd  widget.Editor
+	backupPassEd  widget.Editor
+	fileExportBtn widget.Clickable
+	fileImportBtn widget.Clickable
+
 	showBackup bool
 	backup     string
+	okMsg      string
 	errMsg     string
 }
 
@@ -455,8 +465,31 @@ func (a *uiState) backupSection(gtx layout.Context) layout.Dimensions {
 			return a.button(gtx, &info.exportBtn, colorRaised, colorText, "确认导出", true,
 				layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(16), Right: unit.Dp(16)})
 		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return a.panelMessages(gtx, info.errMsg, "")
+			return a.setupHint(gtx, "更推荐导出为 .ktbackup 文件：它把身份与通讯录"+
+				"打包加密，换台电脑能一次性恢复。用**导出专用口令**保护，"+
+				"建议与登录口令不同。")
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return field(gtx, a.theme, &info.backupPathEd, "保存到（文件路径）", "例如 D:\\backup\\me.ktbackup", 0, false)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return field(gtx, a.theme, &info.backupPassEd, "导出专用口令", "至少 8 个字符，可与登录口令不同", '•', false)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if info.fileExportBtn.Clicked(gtx) {
+				a.doExportBackupFile()
+			}
+			return a.button(gtx, &info.fileExportBtn, colorAccent, color.NRGBA{R: 0x06, G: 0x1A, B: 0x17, A: 0xFF},
+				"导出 .ktbackup", true,
+				layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(16), Right: unit.Dp(16)})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return a.panelMessages(gtx, info.errMsg, info.okMsg)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			if info.backup == "" {
@@ -476,6 +509,50 @@ func (a *uiState) backupSection(gtx layout.Context) layout.Dimensions {
 			)
 		}),
 	)
+}
+
+// doExportBackupFile 把身份与通讯录导出成一个加密的 .ktbackup 文件。
+func (a *uiState) doExportBackupFile() {
+	info := &a.info
+	info.errMsg, info.okMsg = "", ""
+
+	path := strings.TrimSpace(info.backupPathEd.Text())
+	pass := info.backupPassEd.Text()
+	if path == "" {
+		info.errMsg = "请填写要保存到的文件路径。"
+		return
+	}
+	if len(pass) < 8 {
+		info.errMsg = "导出专用口令至少 8 个字符。"
+		return
+	}
+	if a.opts.Setup == nil {
+		info.errMsg = "当前会话没有配置阶段，无法导出。"
+		return
+	}
+
+	if err := a.opts.Setup.ExportBackup(path, pass); err != nil {
+		info.errMsg = backupErrText(err)
+		return
+	}
+	// 口令用完立刻清掉。
+	info.backupPassEd.SetText("")
+	info.okMsg = "已导出到 " + path + "。请把它复制到安全的位置并妥善保管。"
+}
+
+// backupErrText 把备份层的错误翻成人话。
+func backupErrText(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, backup.ErrExists):
+		return "目标文件已存在。为免覆盖旧备份，请换一个文件名。"
+	case errors.Is(err, backup.ErrWrongPassphrase):
+		return "口令不正确（或备份文件已损坏）。"
+	case errors.Is(err, backup.ErrNotABackup):
+		return "这个文件不是 KeyTalk 的备份文件。"
+	}
+	return err.Error()
 }
 
 func (a *uiState) doExportBackup() {

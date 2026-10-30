@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/exeliang/keytalk/internal/backup"
 	"github.com/exeliang/keytalk/internal/crypto"
 )
 
@@ -455,6 +456,80 @@ func (s *Setup) ExportPrivateKey(passphrase string) (string, error) {
 // ExportPublicKey 返回可安全分发的公钥文本。
 func (s *Setup) ExportPublicKey() (string, error) {
 	return s.store.ExportPublicKey()
+}
+
+// ExportBackup 把身份与联系人导出成一个加密的 .ktbackup 文件。
+//
+// exportPassphrase 是**导出专用**口令，可以（也建议）与登录口令不同：
+// 备份文件可能被放在 U 盘或交给别人保管，用登录口令封装会让
+// "拿到备份 + 知道登录口令"等于"拿到全部历史"。
+func (s *Setup) ExportBackup(path, exportPassphrase string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 直接看 s.stage，不要调 Ready()：Ready 会再去 Lock 同一把
+	// 互斥锁，而 Go 的 sync.Mutex 不可重入，那样会自己把自己锁死。
+	if s.stage != StageReady {
+		return ErrSetupNotReady
+	}
+	bk := make([]backup.Contact, 0, len(s.contacts))
+	for _, c := range s.contacts {
+		bk = append(bk, backup.Contact{
+			Fingerprint: c.Fingerprint,
+			Name:        c.Name,
+			PublicKey:   string(c.PublicKey),
+			// ContactConfig 没有 Verified 字段：能进通讯录就意味着
+			// 已带外核对过（AddContact 要求 fingerprintConfirmed）。
+			Verified: true,
+		})
+	}
+	return backup.Export(s.cfg.DataDir, path, bk, exportPassphrase)
+}
+
+// ImportBackupDecoded 解密备份供界面预览（不写盘）。
+func (s *Setup) ImportBackupDecoded(path, exportPassphrase string) (backup.Envelope, error) {
+	return backup.DecodeEnvelope(path, exportPassphrase)
+}
+
+// ImportBackup 用备份文件覆盖当前身份。
+//
+// ⚠️ 只在"尚未有身份"的场景由界面调用（首次启动时从备份恢复）。
+// 已有身份时由 backup.Import 的 overwrite 语义挡住，需要显式确认。
+// 导入成功后必须重建 Setup 状态（重新 refresh），因为身份换了。
+func (s *Setup) ImportBackup(path, exportPassphrase string, overwrite bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := backup.Import(path, s.cfg.DataDir, exportPassphrase, overwrite); err != nil {
+		return err
+	}
+	if err := s.refresh(); err != nil {
+		return err
+	}
+	// 备份里带了通讯录；把它写进 contacts.json，这样即使库是新库，
+	// 联系人列表也能恢复。
+	// （DecodeEnvelope 需要再解一次——代价是一次 argon2，可接受。）
+	env, err := backup.DecodeEnvelope(path, exportPassphrase)
+	if err != nil {
+		return nil // 身份已经恢复成功，通讯录恢复失败不该让整个操作失败
+	}
+	if len(env.Contacts) > 0 {
+		cs := make([]ContactConfig, 0, len(env.Contacts))
+		for _, c := range env.Contacts {
+			cs = append(cs, ContactConfig{
+				Name:        c.Name,
+				Fingerprint: c.Fingerprint,
+				PublicKey:   []byte(c.PublicKey),
+			})
+		}
+		if err := s.saveContactsLocked(cs); err != nil {
+			return err
+		}
+		// saveContactsLocked 只写盘，不更新内存里的切片；
+		// 界面读的是 s.contacts，所以这里必须同步，否则
+		// "导入成功但通讯录是空的"。
+		s.contacts = cs
+	}
+	return nil
 }
 
 // Close 释放身份。不关闭 App——那是调用方的事。

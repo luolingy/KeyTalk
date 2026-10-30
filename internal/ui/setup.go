@@ -4,6 +4,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -33,6 +34,11 @@ type setupState struct {
 
 	tabCreate widget.Clickable
 	tabImport widget.Clickable
+
+	// 从 .ktbackup 恢复
+	bakPathEd widget.Editor
+	bakPassEd widget.Editor
+	bakBtn    widget.Clickable
 	createBtn widget.Clickable
 	importBtn widget.Clickable
 	unlockBtn widget.Clickable
@@ -152,6 +158,8 @@ func (a *uiState) setupCardContent(gtx layout.Context) layout.Dimensions {
 
 func (a *uiState) identityForm(gtx layout.Context) layout.Dimensions {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions { return a.firstRunSteps(gtx) }),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			lbl := material.H6(a.theme, "你的身份")
 			lbl.Color = colorText
@@ -172,6 +180,41 @@ func (a *uiState) identityForm(gtx layout.Context) layout.Dimensions {
 			return a.importForm(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions { return a.setupMessages(gtx) }),
+	)
+}
+
+// firstRunSteps 在首次配置的卡片顶部列出整个流程。
+//
+// 一个只有一个表单的界面会让人不知道"填完之后还要做什么"。
+// 把步骤摆出来，尤其是最后那步"导出备份"——那步很容易被跳过，
+// 而跳过它的后果是硬盘坏了就永远没有身份了。
+func (a *uiState) firstRunSteps(gtx layout.Context) layout.Dimensions {
+	step := func(n string, label string, active bool) layout.FlexChild {
+		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			col := colorMuted
+			if active {
+				col = colorAccent
+			}
+			lbl := material.Caption(a.theme, n+" "+label)
+			lbl.Color = col
+			return lbl.Layout(gtx)
+		})
+	}
+	arrow := func() layout.FlexChild {
+		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Left: unit.Dp(6), Right: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Caption(a.theme, "→")
+				lbl.Color = colorFaint
+				return lbl.Layout(gtx)
+			})
+		})
+	}
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+		step("1", "基础信息", true),
+		arrow(),
+		step("2", "口令与密钥", true),
+		arrow(),
+		step("3", "导出备份", false),
 	)
 }
 
@@ -245,6 +288,7 @@ func (a *uiState) createForm(gtx layout.Context) layout.Dimensions {
 func (a *uiState) importForm(gtx layout.Context) layout.Dimensions {
 	busy := a.su.busy
 	submit := a.su.importBtn.Clicked(gtx)
+	bakSubmit := a.su.bakBtn.Clicked(gtx)
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -274,6 +318,9 @@ func (a *uiState) importForm(gtx layout.Context) layout.Dimensions {
 				layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(10), Left: unit.Dp(24), Right: unit.Dp(24)})
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if bakSubmit && !busy {
+				a.submitImportBackup()
+			}
 			if submit && !busy {
 				a.submitImport()
 			}
@@ -529,6 +576,26 @@ func (a *uiState) submitCreate() {
 	}
 	setup := a.opts.Setup
 	a.startOp(func() error { return setup.CreateIdentity(name, pass) })
+}
+
+// submitImportBackup 从 .ktbackup 恢复身份。
+func (a *uiState) submitImportBackup() {
+	path := strings.TrimSpace(a.su.bakPathEd.Text())
+	pass := a.su.bakPassEd.Text()
+	if path == "" {
+		a.su.errMsg = "请填写备份文件路径。"
+		return
+	}
+	setup := a.opts.Setup
+	a.startOp(func() error {
+		if err := setup.ImportBackup(path, pass, false); err != nil {
+			return err
+		}
+		// 恢复出来的身份是加密的，仍需要用户输入登录口令解锁，
+		// 因此这里不宣称"完成"，只是把界面推进到解锁阶段。
+		a.su.bakPassEd.SetText("")
+		return nil
+	})
 }
 
 func (a *uiState) submitImport() {
