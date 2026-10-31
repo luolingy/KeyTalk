@@ -48,6 +48,12 @@ type Options struct {
 	// 创建的，runGUI 拿到界面选项时还不知道端口号。
 	NetInfoFunc func() NetInfo
 
+	// PublicNet 提供公网（ICE）连接能力（可选）。
+	//
+	// 为 nil 时，界面不显示"公网连接"入口，一切保持局域网行为。
+	// 由 cmd 注入，因为只有它知道 ICE/STUN/TURN 配置。
+	PublicNet PublicNet
+
 	// Title 是窗口标题。
 	Title string
 }
@@ -155,6 +161,22 @@ type uiState struct {
 	// 与 su.errMsg 分开：那是"用户输入有问题"，
 	// 这是"环境有问题"，处置方式不同。
 	appStartErr string
+
+	// --- 连接方式选择 / 公网连接 ---
+	//
+	// connecting 为 true 表示已进入"选择连接方式"这一步
+	// （仅在 opts.PublicNet != nil 时出现）。chooseMode==0 是待选，
+	// 1 是局域网，2 是公网。
+	connecting      bool
+	chooseMode      int
+	transportChosen bool
+	choiceScroll    widget.List
+	pub             publicChoiceState
+
+	// choiceLANBtn / choicePubBtn 是"选择连接方式"界面的两个按钮。
+	// 持久字段（原因同 sendBtn：每帧新建会导致点击永远收不到）。
+	choiceLANBtn widget.Clickable
+	choicePubBtn widget.Clickable
 
 	// showInfo 控制配置信息面板。
 	showInfo bool

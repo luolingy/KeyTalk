@@ -430,3 +430,9 @@ func ptrDur(d time.Duration) *time.Duration { return &d }
 
 // 断言 stun 包被使用（allURLs 依赖它），避免误删 import。
 var _ = stun.ParseURI
+
+// EnableLoopbackForTest 打开 loopback 候选收集，仅供**本机多实例测试**。
+//
+// 生产代码绝不调用它：公网连接需要真实的 host/srflx/relay 候选，
+// 而 loopback 只是为了在单机上验证握手与帧通路。
+func (t *Transport) EnableLoopbackForTest() { t.testLoopback = true }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/exeliang/keytalk/internal/core"
 	"github.com/exeliang/keytalk/internal/crypto"
+	"github.com/exeliang/keytalk/internal/transport"
 	"github.com/exeliang/keytalk/internal/transport/lan"
 	"github.com/exeliang/keytalk/internal/ui"
 )
@@ -47,33 +48,52 @@ func runGUI(ctx context.Context, opt options, logf func(string, ...any)) error {
 		discoErrText string
 	)
 
+	// 公网（ICE）控制器：界面通过它生成/连接信令。
+	// 用 opt 里的 STUN/TURN 配置构造。
+	iceCtl := newICEController(opt, logf)
+
 	setup, err := core.NewSetup(core.SetupConfig{
 		DataDir: opt.dataDir,
 		Logf:    logf,
 		BuildApp: func(sess core.SetupSession) (*core.App, error) {
 
 			fp := sess.Identity.Fingerprint()
+			// 身份就绪：把指纹告诉公网控制器（信令里要带）。
+			iceCtl.setFingerprint(fp.String())
 
-			gtr := lan.New(lan.Config{
-				Fingerprint:     fp.String(),
-				DisplayName:     opt.name,
-				ListenPort:      opt.listenPort,
-				ProtocolVersion: "1",
-				Logf:            logf,
-			})
-			if err := gtr.Start(ctx); err != nil {
-				return nil, fmt.Errorf("启动网络: %w", err)
+			// 传输层选择：用户若已选公网并连上，用那条 ICE 连接；
+			// 否则建局域网（mDNS + TCP）。这是**唯一**建传输层的地方。
+			var gtr transport.Transport
+			if chosen := iceCtl.chosenTransport(); chosen != nil {
+				gtr = chosen
+				netMu.Lock()
+				listenAddr = "公网（ICE）"
+				discoActive = true // 公网模式下"发现"由手动信令完成
+				discoErrText = ""
+				netMu.Unlock()
+				logf("gui: using ICE transport for the app")
+			} else {
+				ltr := lan.New(lan.Config{
+					Fingerprint:     fp.String(),
+					DisplayName:     opt.name,
+					ListenPort:      opt.listenPort,
+					ProtocolVersion: "1",
+					Logf:            logf,
+				})
+				if err := ltr.Start(ctx); err != nil {
+					return nil, fmt.Errorf("启动网络: %w", err)
+				}
+				gtr = ltr
+				netMu.Lock()
+				listenAddr = ltr.LocalAddr().String()
+				discoActive = ltr.DiscoveryActive()
+				if !discoActive {
+					// 如实报告，绝不宣称一个没有运行的功能。
+					discoErrText = fmt.Sprintf("%v", ltr.DiscoveryError())
+					logf("gui: WARNING mDNS discovery unavailable: %v", ltr.DiscoveryError())
+				}
+				netMu.Unlock()
 			}
-
-			netMu.Lock()
-			listenAddr = gtr.LocalAddr().String()
-			discoActive = gtr.DiscoveryActive()
-			if !discoActive {
-				// 如实报告，绝不宣称一个没有运行的功能。
-				discoErrText = fmt.Sprintf("%v", gtr.DiscoveryError())
-				logf("gui: WARNING mDNS discovery unavailable: %v", gtr.DiscoveryError())
-			}
-			netMu.Unlock()
 
 			// 关键：把**已核对**的指纹显式传入。
 			// core 会拒绝在"有联系人但未标记已核对"时启动——这是有意的：
@@ -125,9 +145,10 @@ func runGUI(ctx context.Context, opt options, logf func(string, ...any)) error {
 
 	return ui.Run(ui.Options{
 		// App 故意留空：由 Setup 在身份就绪后组装。
-		Setup: setup,
-		Title: "KeyTalk",
-		Logf:  logf,
+		Setup:     setup,
+		Title:     "KeyTalk",
+		Logf:      logf,
+		PublicNet: iceCtl,
 		NetInfoFunc: func() ui.NetInfo {
 			netMu.Lock()
 			defer netMu.Unlock()

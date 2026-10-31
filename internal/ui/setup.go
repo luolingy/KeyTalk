@@ -67,6 +67,24 @@ type appStartError struct {
 func (a *uiState) layoutSetup(gtx layout.Context) {
 	fillRect(gtx, colorBackground, gtx.Constraints.Max)
 
+	// 身份已就绪且提供了公网能力时，先让用户选连接方式
+	// （局域网 / 公网）。这是一个独立屏，因为它决定了随后
+	// BuildApp 要用的传输层——不能等到 App 建好再换。
+	if a.isChoiceScreen() {
+		layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(a.setupTopBar),
+			layout.Rigid(vLineH),
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return a.choiceCard(gtx)
+				})
+			}),
+			layout.Rigid(vLineH),
+			layout.Rigid(a.statusBar),
+		)
+		return
+	}
+
 	layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(a.setupTopBar),
 		layout.Rigid(vLineH),
@@ -78,6 +96,37 @@ func (a *uiState) layoutSetup(gtx layout.Context) {
 		layout.Rigid(vLineH),
 		layout.Rigid(a.statusBar),
 	)
+}
+
+// choiceCard 是选择连接方式 / 公网连接面板的居中卡片（更宽、可滚动）。
+func (a *uiState) choiceCard(gtx layout.Context) layout.Dimensions {
+	maxW := gtx.Dp(unit.Dp(600))
+	if gtx.Constraints.Max.X > maxW {
+		gtx.Constraints.Max.X = maxW
+	}
+	maxH := gtx.Constraints.Max.Y - gtx.Dp(unit.Dp(40))
+	if maxH > 0 && gtx.Constraints.Max.Y > maxH {
+		gtx.Constraints.Max.Y = maxH
+	}
+	// 面板可能比窗口高（公网面板内容较多），用材料 List 让它可滚动，
+	// 否则底部按钮在窄窗口里会被裁掉、点不到。
+	return a.scrollContent(gtx, &a.choiceScroll, func(gtx layout.Context) layout.Dimensions {
+		return layout.Background{}.Layout(gtx,
+			func(gtx layout.Context) layout.Dimensions {
+				m := op.Record(gtx.Ops)
+				dims := a.choiceContent(gtx)
+				m.Stop()
+				fillRounded(gtx, colorSurface, dims.Size, gtx.Dp(unit.Dp(radiusCard)))
+				return dims
+			},
+			a.choiceContent,
+		)
+	})
+}
+
+func (a *uiState) choiceContent(gtx layout.Context) layout.Dimensions {
+	inset := layout.Inset{Top: unit.Dp(24), Bottom: unit.Dp(24), Left: unit.Dp(28), Right: unit.Dp(28)}
+	return inset.Layout(gtx, a.choiceScreen)
 }
 
 // setupTopBar 说明"为什么先看到这一页"。
@@ -650,6 +699,14 @@ func (a *uiState) pumpSetup() {
 		return
 	}
 	if !a.opts.Setup.Ready() {
+		return
+	}
+
+	// 身份就绪：若提供了公网能力且用户还没确认连接方式，
+	// 先进选择屏。transportChosen 一旦为 true 就不再回到选择屏，
+	// 之后无论局域网还是公网都直接建 App。
+	if a.opts.PublicNet != nil && !a.transportChosen {
+		a.connecting = true
 		return
 	}
 
