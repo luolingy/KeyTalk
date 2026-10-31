@@ -82,6 +82,25 @@ type options struct {
 	// 两者共用同一套 core（下面的 runGUI 会新建一个 core.App），
 	// 因此加密与网络行为完全一致，只有呈现方式不同。
 	gui bool
+
+	// --- 公网（ICE）相关 ---
+
+	// stun 是逗号分隔的 STUN URL 列表（默认用内置公共列表）。
+	stun string
+	// turn 是逗号分隔的 TURN URL 列表（用户自备；空表示不使用中继）。
+	turn string
+	// turnUser / turnPass 是 TURN 凭据。
+	turnUser string
+	turnPass string
+	// iceOffer 为 true 时：收集候选、打印本端信令后退出（供对端粘贴）。
+	iceOffer bool
+	// iceAnswer 是要连接的对端信令文本（配合 ICE 模式使用）。
+	iceAnswer string
+}
+
+// publicMode 报告是否应当使用公网 ICE 传输层。
+func (o *options) publicMode() bool {
+	return o.iceOffer || o.iceAnswer != ""
 }
 
 func run() error {
@@ -95,6 +114,12 @@ func run() error {
 	flag.BoolVar(&opt.verbose, "v", false, "输出详细日志")
 	flag.BoolVar(&opt.setupOnly, "setup", false, "仅生成身份并导入联系人，然后退出（不进入聊天）")
 	flag.BoolVar(&opt.gui, "gui", false, "使用图形界面（默认使用命令行界面）")
+	flag.StringVar(&opt.stun, "stun", "", "STUN 服务器 URL，逗号分隔（默认使用公共 STUN）")
+	flag.StringVar(&opt.turn, "turn", "", "TURN 服务器 URL，逗号分隔（需自行配置，空=不使用中继）")
+	flag.StringVar(&opt.turnUser, "turn-user", "", "TURN 用户名")
+	flag.StringVar(&opt.turnPass, "turn-pass", "", "TURN 密码")
+	flag.BoolVar(&opt.iceOffer, "ice-offer", false, "公网模式：打印本端连接信令后退出（把它发给对方）")
+	flag.StringVar(&opt.iceAnswer, "ice-answer", "", "公网模式：粘贴对方信令以建立连接")
 	flag.Parse()
 
 	// 无参数的裸启动 = 双击启动。
@@ -217,6 +242,11 @@ func run() error {
 			}
 		}
 		return nil
+	}
+
+	// --- 公网（ICE）模式 ---
+	if opt.publicMode() {
+		return runPublic(ctx, &opt, fp, identity, contacts, logf)
 	}
 
 	// --- 命令行模式 ---
